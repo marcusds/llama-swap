@@ -1103,6 +1103,7 @@ func (pm *ProxyManager) listRunningProcessesHandler(context *gin.Context) {
 				runningProcesses = append(runningProcesses, gin.H{
 					"model":       process.ID,
 					"state":       process.state,
+					"busy":        process.IsBusy(),
 					"cmd":         process.config.Cmd,
 					"proxy":       process.config.Proxy,
 					"ttl":         process.config.UnloadAfter,
@@ -1118,6 +1119,7 @@ func (pm *ProxyManager) listRunningProcessesHandler(context *gin.Context) {
 					runningProcesses = append(runningProcesses, gin.H{
 						"model":       process.ID,
 						"state":       process.state,
+						"busy":        process.IsBusy(),
 						"cmd":         process.config.Cmd,
 						"proxy":       process.config.Proxy,
 						"ttl":         process.config.UnloadAfter,

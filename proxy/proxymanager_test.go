@@ -674,6 +674,7 @@ models:
 		Running []struct {
 			Model       string `json:"model"`
 			State       string `json:"state"`
+			Busy        bool   `json:"busy"`
 			Cmd         string `json:"cmd"`
 			Proxy       string `json:"proxy"`
 			TTL         int    `json:"ttl"`
@@ -732,6 +733,45 @@ models:
 		assert.NotEmpty(t, response.Running[0].Cmd, "cmd should be populated")
 		assert.NotEmpty(t, response.Running[0].Proxy, "proxy should be populated")
 		assert.Equal(t, 0, response.Running[0].TTL, "ttl should default to globalTTL (0)")
+	})
+
+	t.Run("model shows busy when handling request", func(t *testing.T) {
+		// Start a long-running request in a goroutine
+		done := make(chan struct{})
+		reqBody := `{"model":"model1"}`
+		req := httptest.NewRequest("POST", "/v1/chat/completions?wait=2s", bytes.NewBufferString(reqBody))
+		w := CreateTestResponseRecorder()
+		go func() {
+			proxy.ServeHTTP(w, req)
+			close(done)
+		}()
+
+		// Brief pause for request to start processing
+		time.Sleep(100 * time.Millisecond)
+
+		// Check /running while request is in flight
+		req = httptest.NewRequest("GET", "/running", nil)
+		w = CreateTestResponseRecorder()
+		proxy.ServeHTTP(w, req)
+
+		var response RunningResponse
+		assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+		assert.Len(t, response.Running, 1)
+		assert.Equal(t, "ready", response.Running[0].State, "state should remain ready")
+		assert.True(t, response.Running[0].Busy, "busy should be true while handling request")
+
+		// Wait for request to complete
+		<-done
+
+		// Check /running after request completes
+		req = httptest.NewRequest("GET", "/running", nil)
+		w = CreateTestResponseRecorder()
+		proxy.ServeHTTP(w, req)
+
+		assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+		assert.Len(t, response.Running, 1)
+		assert.Equal(t, "ready", response.Running[0].State)
+		assert.False(t, response.Running[0].Busy, "busy should be false after request completes")
 	})
 }
 

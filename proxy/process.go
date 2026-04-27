@@ -225,6 +225,11 @@ func (p *Process) CurrentState() ProcessState {
 	return p.state
 }
 
+// IsBusy returns true when the process is ready and handling in-flight requests.
+func (p *Process) IsBusy() bool {
+	return p.CurrentState() == StateReady && p.inFlightRequestsCount.Load() > 0
+}
+
 // forceState forces the process state to the new state with mutex protection.
 // This should only be used in exceptional cases where the normal state transition
 // validation via swapState() cannot be used.
