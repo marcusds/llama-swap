@@ -152,11 +152,13 @@ type Config struct {
 	// New code must read Routing, never the backwards-compat fields below.
 	Routing RoutingConfig `yaml:"routing"`
 
-	// Groups and Matrix are permanent backwards-compat input fields for the
-	// legacy top-level `groups:`/`matrix:` keys. They are normalized into
-	// Routing by LoadConfigFromReader. New code must not read them directly.
-	Groups map[string]GroupConfig `yaml:"groups"` /* key is group ID */
-	Matrix *MatrixConfig          `yaml:"matrix"`
+	// Groups, Matrix and MemoryBudget are permanent backwards-compat input
+	// fields for the legacy top-level `groups:`/`matrix:`/`memoryBudget:`
+	// keys. They are normalized into Routing by LoadConfigFromReader. New
+	// code must not read them directly.
+	Groups       map[string]GroupConfig `yaml:"groups"` /* key is group ID */
+	Matrix       *MatrixConfig          `yaml:"matrix"`
+	MemoryBudget *MemoryBudgetConfig    `yaml:"memoryBudget"`
 
 	// for key/value replacements in model's cmd, cmdStop, proxy, checkEndPoint
 	Macros MacroList `yaml:"macros"`
@@ -206,13 +208,14 @@ type FifoConfig struct {
 }
 
 type RouterConfig struct {
-	Use      string         `yaml:"use"` // "group" (default) | "matrix"
+	Use      string         `yaml:"use"` // "group" (default) | "matrix" | "memoryBudget"
 	Settings RouterSettings `yaml:"settings"`
 }
 
 type RouterSettings struct {
-	Groups map[string]GroupConfig `yaml:"groups"`
-	Matrix *MatrixConfig          `yaml:"matrix"`
+	Groups       map[string]GroupConfig `yaml:"groups"`
+	Matrix       *MatrixConfig          `yaml:"matrix"`
+	MemoryBudget *MemoryBudgetConfig    `yaml:"memoryBudget"`
 }
 
 func (c *Config) RealModelName(search string) (string, bool) {

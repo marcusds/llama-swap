@@ -77,6 +77,7 @@ llama-swap supports many more features to customize how you want to manage your 
 | `ttl`     | automatic unloading of models after a timeout  |
 | `macros`  | reusable snippets to use in configurations     |
 | `matrix`  | run multiple models at a time                  |
+| `memoryBudget` | priority-based eviction under a memory cap |
 | `hooks`   | event driven functionality                     |
 | `env`     | define environment variables per model         |
 | `aliases` | serve a model with different names             |
@@ -595,6 +596,52 @@ matrix:
     # 70B model uses all GPUs, can only run alone
     # vars are not required when using real model IDs
     full: "llama-70B"
+
+# =============================================================================
+# memoryBudget: priority-based eviction under a total memory cap
+# =============================================================================
+#
+# Note:
+# A config must use only one of matrix, memoryBudget, or legacy groups.
+# A configuration error will occur if more than one is defined.
+#
+# Instead of declaring valid combinations of models (matrix) or swap groups,
+# memoryBudget keeps the sum of running models' memory usage under limit.
+# Models are given a priority: important, frequently used, low-latency models
+# get a high priority so they stay loaded; lower priority models are evicted
+# first when room is needed. Memory usage per model is not declared here —
+# it's measured live from each process's RSS after it serves a request, so
+# the first request to a new model is optimistic (assumed to need 0MB) and
+# the estimate self-corrects afterwards.
+#
+# Solver behavior (runs when a model is requested):
+#   1. If the requested model is already running, forward immediately. Done.
+#   2. If current usage + the requested model's last-measured memory fits
+#      under limit, no eviction needed. Start it. Forward request.
+#   3. Otherwise, evict running models lowest-priority-first (ties broken by
+#      least-recently-used) until it fits. Because the requested model must
+#      load now, eviction proceeds through higher-priority models too if
+#      that's what it takes to fit.
+#   4. Start the requested model. Forward request.
+#
+# limit is a soft cap: if a single model's memory exceeds limit on its own,
+# it still runs (everything else is evicted first) and a warning is logged.
+#
+# Models not listed under memoryBudget.models default to priority: 0.
+#
+# limit accepts a bare number (megabytes) or a human-readable string with a
+# unit suffix: B, KB, MB, GB, TB (e.g. "512MB", "8GB", "1TB").
+#
+memoryBudget:
+  limit: 24GB
+
+  models:
+    gemma-model:
+      priority: 10 # kept loaded, evicted last
+    qwen-model:
+      priority: 5
+    mistral-model:
+      priority: 1 # evicted first when room is needed
 
 # hooks: a dictionary of event triggers and actions
 # - optional, default: empty dictionary

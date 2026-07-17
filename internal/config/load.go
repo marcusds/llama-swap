@@ -180,20 +180,21 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		config.Models[modelId] = modelConfig
 	}
 
-	// Normalize routing config. The legacy top-level `matrix`/`groups` keys and
-	// the new `routing.router` block are mutually exclusive: a config may use
-	// either style, never both.
-	hasTopLevel := config.Matrix != nil || len(config.Groups) > 0
+	// Normalize routing config. The legacy top-level `matrix`/`groups`/
+	// `memoryBudget` keys and the new `routing.router` block are mutually
+	// exclusive: a config may use either style, never both.
+	hasTopLevel := config.Matrix != nil || len(config.Groups) > 0 || config.MemoryBudget != nil
 	rtr := config.Routing.Router
-	hasRouting := rtr.Use != "" || rtr.Settings.Matrix != nil || len(rtr.Settings.Groups) > 0
+	hasRouting := rtr.Use != "" || rtr.Settings.Matrix != nil || len(rtr.Settings.Groups) > 0 || rtr.Settings.MemoryBudget != nil
 
 	if hasTopLevel && hasRouting {
-		return Config{}, fmt.Errorf("config uses both the legacy top-level 'matrix'/'groups' keys and the new 'routing.router' block; please migrate the top-level keys into 'routing.router' and remove them")
+		return Config{}, fmt.Errorf("config uses both the legacy top-level 'matrix'/'groups'/'memoryBudget' keys and the new 'routing.router' block; please migrate the top-level keys into 'routing.router' and remove them")
 	}
 
 	if !hasTopLevel {
-		// Both groups and matrix may be defined under routing.router.settings;
-		// routing.router.use selects which one is active, so there is no conflict.
+		// groups, matrix and memoryBudget may all be defined under
+		// routing.router.settings; routing.router.use selects which one is
+		// active, so there is no conflict.
 		rs := config.Routing.Router.Settings
 		switch config.Routing.Router.Use {
 		case "matrix":
@@ -201,21 +202,36 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 				return Config{}, fmt.Errorf("routing.router.use is 'matrix' but routing.router.settings.matrix is not set")
 			}
 			config.Matrix = rs.Matrix
+		case "memoryBudget":
+			if rs.MemoryBudget == nil {
+				return Config{}, fmt.Errorf("routing.router.use is 'memoryBudget' but routing.router.settings.memoryBudget is not set")
+			}
+			config.MemoryBudget = rs.MemoryBudget
 		case "group", "":
 			config.Groups = rs.Groups
 		default:
-			return Config{}, fmt.Errorf("routing.router.use: unknown router %q (valid: group, matrix)", config.Routing.Router.Use)
+			return Config{}, fmt.Errorf("routing.router.use: unknown router %q (valid: group, matrix, memoryBudget)", config.Routing.Router.Use)
 		}
 	}
 
-	// groups XOR matrix
+	// groups XOR matrix XOR memoryBudget
 	if config.Matrix != nil && len(config.Groups) > 0 {
 		return Config{}, fmt.Errorf("config cannot use both 'groups' and 'matrix'")
+	}
+	if config.MemoryBudget != nil && len(config.Groups) > 0 {
+		return Config{}, fmt.Errorf("config cannot use both 'groups' and 'memoryBudget'")
+	}
+	if config.MemoryBudget != nil && config.Matrix != nil {
+		return Config{}, fmt.Errorf("config cannot use both 'matrix' and 'memoryBudget'")
 	}
 
 	if config.Matrix != nil {
 		if err := ValidateMatrix(config.Matrix, config.Models); err != nil {
 			return Config{}, fmt.Errorf("matrix: %w", err)
+		}
+	} else if config.MemoryBudget != nil {
+		if err := ValidateMemoryBudget(*config.MemoryBudget, config.Models); err != nil {
+			return Config{}, fmt.Errorf("memoryBudget: %w", err)
 		}
 	} else {
 		config = AddDefaultGroupToConfig(config)
@@ -241,13 +257,17 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	// Build the canonical Config.Routing from the effective result. Both legacy
 	// and new-style configs converge here. The Matrix pointer is shared so the
 	// compiled matrix program stays in one place.
-	if config.Matrix != nil {
+	switch {
+	case config.Matrix != nil:
 		config.Routing.Router.Use = "matrix"
-	} else {
+	case config.MemoryBudget != nil:
+		config.Routing.Router.Use = "memoryBudget"
+	default:
 		config.Routing.Router.Use = "group"
 	}
 	config.Routing.Router.Settings.Matrix = config.Matrix
 	config.Routing.Router.Settings.Groups = config.Groups
+	config.Routing.Router.Settings.MemoryBudget = config.MemoryBudget
 
 	if config.Routing.Scheduler.Use == "" {
 		config.Routing.Scheduler.Use = "fifo"

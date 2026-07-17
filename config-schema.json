@@ -41,6 +41,20 @@
             "default": {},
             "description": "A dictionary of string substitutions. Global macros can be used in any configuration value; model macros are scoped to their model. Macro names must be <64 chars, match ^[a-zA-Z0-9_-]+$, and not be PID, PORT, or MODEL_ID. Values can be string, number, or boolean. Macros can reference other macros defined before them."
         },
+        "memorySize": {
+            "oneOf": [
+                {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Bare number, interpreted as megabytes."
+                },
+                {
+                    "type": "string",
+                    "pattern": "^\\s*[0-9]+(\\.[0-9]+)?\\s*([bBkKmMgGtT][bB]?)?\\s*$",
+                    "description": "Human-readable size, e.g. \"100MB\", \"1GB\", \"1TB\"."
+                }
+            ]
+        },
         "timeouts": {
             "type": "object",
             "properties": {
@@ -117,6 +131,35 @@
                 }
             },
             "description": "A dictionary of group settings. Provides advanced controls over model swapping behaviour. Model IDs must be defined in models. A model can only be a member of one group. Behaviour controlled via swap, exclusive, persistent."
+        },
+        "memoryBudgetConfig": {
+            "type": "object",
+            "description": "Priority-based alternative to groups/matrix. Tracks a total memory cap and evicts lowest-priority running models when starting a new model would exceed limit. Per-model memory usage is measured live from process RSS, not declared in config. A config must use only one of groups, matrix, or memoryBudget.",
+            "required": [
+                "limit"
+            ],
+            "properties": {
+                "limit": {
+                    "$ref": "#/definitions/memorySize",
+                    "description": "Total memory cap across all running models."
+                },
+                "models": {
+                    "type": "object",
+                    "description": "Per-model eviction priority. Keys must be model IDs defined in models. Models not listed default to priority: 0.",
+                    "additionalProperties": {
+                        "type": "object",
+                        "properties": {
+                            "priority": {
+                                "type": "integer",
+                                "default": 0,
+                                "description": "Higher priority models are evicted last. Ties broken by least-recently-used."
+                            }
+                        },
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "additionalProperties": false
         },
         "matrixConfig": {
             "type": "object",
@@ -610,6 +653,9 @@
         "matrix": {
             "$ref": "#/definitions/matrixConfig"
         },
+        "memoryBudget": {
+            "$ref": "#/definitions/memoryBudgetConfig"
+        },
         "hooks": {
             "type": "object",
             "properties": {
@@ -805,10 +851,11 @@
                             "type": "string",
                             "enum": [
                                 "group",
-                                "matrix"
+                                "matrix",
+                                "memoryBudget"
                             ],
                             "default": "group",
-                            "description": "Router to use. 'group' uses static groups, 'matrix' uses the solver-based swap matrix."
+                            "description": "Router to use. 'group' uses static groups, 'matrix' uses the solver-based swap matrix, 'memoryBudget' uses priority-based eviction under a total memory cap."
                         },
                         "settings": {
                             "type": "object",
@@ -818,6 +865,9 @@
                                 },
                                 "matrix": {
                                     "$ref": "#/definitions/matrixConfig"
+                                },
+                                "memoryBudget": {
+                                    "$ref": "#/definitions/memoryBudgetConfig"
                                 }
                             },
                             "additionalProperties": false
@@ -855,6 +905,36 @@
                     "required": [
                         "groups"
                     ]
+                }
+            }
+        },
+        {
+            "if": {
+                "required": ["groups"]
+            },
+            "then": {
+                "not": {
+                    "required": ["memoryBudget"]
+                }
+            }
+        },
+        {
+            "if": {
+                "required": ["matrix"]
+            },
+            "then": {
+                "not": {
+                    "required": ["memoryBudget"]
+                }
+            }
+        },
+        {
+            "if": {
+                "required": ["memoryBudget"]
+            },
+            "then": {
+                "not": {
+                    "required": ["groups", "matrix"]
                 }
             }
         }

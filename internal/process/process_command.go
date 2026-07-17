@@ -91,6 +91,10 @@ type ProcessCommand struct {
 
 	lastUse  atomic.Int64 // unix nano timestamp of last ServeHTTP completion
 	inflight atomic.Int64 // current in-flight ServeHTTP calls
+
+	// pid is the OS PID of the running upstream process, or 0 when none is
+	// running. Written only by run(); read via Pid().
+	pid atomic.Int64
 }
 
 var _ Process = (*ProcessCommand)(nil)
@@ -121,6 +125,23 @@ func New(
 }
 
 func (p *ProcessCommand) Logger() *logmon.Monitor { return p.processLogger }
+
+// Pid returns the OS PID of the running upstream process. ok is false when
+// no process is currently running.
+func (p *ProcessCommand) Pid() (int, bool) {
+	pid := p.pid.Load()
+	return int(pid), pid != 0
+}
+
+// LastUse returns the time of the last ServeHTTP completion, or the zero
+// time if the process has never served a request.
+func (p *ProcessCommand) LastUse() time.Time {
+	ns := p.lastUse.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
+}
 
 // run is the single-writer goroutine that owns all mutable lifecycle state
 // (current ProcessState, the running *exec.Cmd, the active reverse-proxy
@@ -198,6 +219,7 @@ func (p *ProcessCommand) run() {
 				cmd = nil
 				cmdDone = nil
 				cmdCancel = nil
+				p.pid.Store(0)
 			}
 			notifyWaiters(fmt.Errorf("[%s] shutdown", p.id))
 			respondRun(fmt.Errorf("[%s] shutdown", p.id))
@@ -214,6 +236,7 @@ func (p *ProcessCommand) run() {
 			cmd = nil
 			cmdDone = nil
 			cmdCancel = nil
+			p.pid.Store(0)
 			p.handler.Store(nil)
 			setState(StateStopped)
 			p.proxyLogger.Warnf("<%s> upstream process exited unexpectedly", p.id)
@@ -287,6 +310,9 @@ func (p *ProcessCommand) run() {
 					cmd = res.cmd
 					cmdDone = res.cmdDone
 					cmdCancel = res.cancel
+					if cmd.Process != nil {
+						p.pid.Store(int64(cmd.Process.Pid))
+					}
 					fn := res.handlerFn
 					p.handler.Store(&fn)
 					setState(StateReady)
@@ -381,6 +407,7 @@ func (p *ProcessCommand) run() {
 				cmd = nil
 				cmdDone = nil
 				cmdCancel = nil
+				p.pid.Store(0)
 				p.handler.Store(nil)
 			}
 			// Stop is a no-op (and not an error) when already Stopped — this

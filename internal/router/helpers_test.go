@@ -36,6 +36,8 @@ type fakeProcess struct {
 
 	mu          sync.Mutex
 	state       process.ProcessState
+	lastUse     time.Time
+	testPid     int // stubbed PID returned by Pid() while running; tests set this directly
 	readyCh     chan struct{}
 	stopCh      chan struct{}
 	runStarted  chan struct{} // closed on the first Run/EnsureReady call that starts
@@ -274,6 +276,27 @@ func (f *fakeProcess) WaitReady(ctx context.Context) error {
 
 func (f *fakeProcess) Logger() *logmon.Monitor { return logmon.NewWriter(io.Discard) }
 
+// Pid returns a fake non-zero PID while the process is running, matching the
+// real Process contract closely enough for tests that don't care about the
+// actual value.
+func (f *fakeProcess) Pid() (int, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.state == process.StateStopped || f.state == process.StateShutdown {
+		return 0, false
+	}
+	if f.testPid != 0 {
+		return f.testPid, true
+	}
+	return 1, true
+}
+
+func (f *fakeProcess) LastUse() time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastUse
+}
+
 func (f *fakeProcess) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	f.serveCalls.Add(1)
 	f.inFlightServe.Add(1)
@@ -290,6 +313,9 @@ func (f *fakeProcess) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	}
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, "ok:%s", f.id)
+	f.mu.Lock()
+	f.lastUse = time.Now()
+	f.mu.Unlock()
 }
 
 // waitProcessed drains n events from ch, fataling on timeout. One event fires
