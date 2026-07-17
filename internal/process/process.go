@@ -67,4 +67,12 @@ type Process interface {
 
 	// Logger returns the monitor that captures this process's stdout/stderr.
 	Logger() *logmon.Monitor
+
+	// Pid returns the OS PID of the running upstream process. ok is false
+	// when no process is currently running.
+	Pid() (pid int, ok bool)
+
+	// LastUse returns the time of the last ServeHTTP completion, or the
+	// zero time if the process has never served a request.
+	LastUse() time.Time
 }
