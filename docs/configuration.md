@@ -606,26 +606,31 @@ matrix:
 # A configuration error will occur if more than one is defined.
 #
 # Instead of declaring valid combinations of models (matrix) or swap groups,
-# memoryBudget keeps the sum of running models' memory usage under limit.
-# Models are given a priority: important, frequently used, low-latency models
-# get a high priority so they stay loaded; lower priority models are evicted
-# first when room is needed. Memory usage per model is not declared here —
-# it's measured live from each process's RSS after it serves a request, so
-# the first request to a new model is optimistic (assumed to need 0MB) and
-# the estimate self-corrects afterwards.
+# memoryBudget keeps total VRAM used under limit. Models are given a
+# priority: important, frequently used, low-latency models get a high
+# priority so they stay loaded; lower priority models are evicted first when
+# room is needed.
+#
+# VRAM usage is measured live from the host's GPU monitor (nvidia-smi,
+# rocm-smi, LACT, ...) — the same multi-vendor sampling used for the
+# Performance dashboard — so this router requires performance monitoring to
+# be enabled (`performance.disabled: false`, the default). It is total VRAM
+# used across all GPUs, not per-model: GPU tools don't expose a reliable
+# per-process breakdown across vendors, so each evicted model is assumed to
+# free an equal share of the total.
 #
 # Solver behavior (runs when a model is requested):
 #   1. If the requested model is already running, forward immediately. Done.
-#   2. If current usage + the requested model's last-measured memory fits
-#      under limit, no eviction needed. Start it. Forward request.
+#   2. If current total VRAM used fits under limit, no eviction needed. Start
+#      it. Forward request.
 #   3. Otherwise, evict running models lowest-priority-first (ties broken by
-#      least-recently-used) until it fits. Because the requested model must
-#      load now, eviction proceeds through higher-priority models too if
-#      that's what it takes to fit.
+#      least-recently-used) until the estimate fits. Because the requested
+#      model must load now, eviction proceeds through higher-priority models
+#      too if that's what it takes to fit.
 #   4. Start the requested model. Forward request.
 #
-# limit is a soft cap: if a single model's memory exceeds limit on its own,
-# it still runs (everything else is evicted first) and a warning is logged.
+# limit is a soft cap: if VRAM is still over limit after evicting every
+# other model, the requested model still runs.
 #
 # Models not listed under memoryBudget.models default to priority: 0.
 #

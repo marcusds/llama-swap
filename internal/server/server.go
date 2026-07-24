@@ -166,7 +166,7 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 			return nil, fmt.Errorf("creating matrix router: %w", err)
 		}
 	case "memoryBudget":
-		local, err = router.NewMemoryBudget(cfg, proxylog, upstreamlog)
+		local, err = router.NewMemoryBudget(cfg, proxylog, upstreamlog, perfMon)
 		if err != nil {
 			return nil, fmt.Errorf("creating memoryBudget router: %w", err)
 		}
