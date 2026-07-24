@@ -134,14 +134,14 @@
         },
         "memoryBudgetConfig": {
             "type": "object",
-            "description": "Priority-based alternative to groups/matrix. Tracks a total memory cap and evicts lowest-priority running models when starting a new model would exceed limit. Per-model memory usage is measured live from process RSS, not declared in config. A config must use only one of groups, matrix, or memoryBudget.",
+            "description": "Priority-based alternative to groups/matrix. Tracks a total VRAM cap and evicts lowest-priority running models when starting a new model would exceed limit. Total VRAM used is measured live from the host's GPU monitor (nvidia-smi, rocm-smi, LACT, ...); requires performance monitoring to be enabled. A config must use only one of groups, matrix, or memoryBudget.",
             "required": [
                 "limit"
             ],
             "properties": {
                 "limit": {
                     "$ref": "#/definitions/memorySize",
-                    "description": "Total memory cap across all running models."
+                    "description": "Total VRAM cap across all GPUs."
                 },
                 "models": {
                     "type": "object",

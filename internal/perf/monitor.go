@@ -197,6 +197,33 @@ func (m *Monitor) Current() ([]SysStat, []GpuStat) {
 	return sysStats, gpuStats
 }
 
+// LatestGpuStats returns the most recently sampled GPU stats snapshot (one
+// entry per GPU), or nil if none has been recorded yet.
+func (m *Monitor) LatestGpuStats() []GpuStat {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+	snapshot, ok := m.gpuRing.Last()
+	if !ok {
+		return nil
+	}
+	return snapshot
+}
+
+// VRAMUsedMB sums MemUsedMB across all GPUs from the latest sample. ok is
+// false if no GPU stats have been recorded yet (monitoring disabled, no
+// supported tool found on this host, or no sample collected yet).
+func (m *Monitor) VRAMUsedMB() (mb int64, ok bool) {
+	stats := m.LatestGpuStats()
+	if len(stats) == 0 {
+		return 0, false
+	}
+	var total int64
+	for _, s := range stats {
+		total += int64(s.MemUsedMB)
+	}
+	return total, true
+}
+
 func ReadSysStats() (SysStat, error) {
 	return readSysStats()
 }
