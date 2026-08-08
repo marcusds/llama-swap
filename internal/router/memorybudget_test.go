@@ -408,11 +408,69 @@ func TestMemoryBudgetSwapper_ReservesForInFlightLoads(t *testing.T) {
 	// the sample yet. Without a reservation this looks like it fits under
 	// the 800 limit.
 	s := newTestMemoryBudgetSwapper(800, priority, processes, 600)
-	s.recordLearned([]string{"b"}, 500) // b previously observed costing ~500MB
+	// b previously observed costing ~500MB, enough times to be trusted.
+	s.recordLearned([]string{"b"}, 500)
+	s.recordLearned([]string{"b"}, 500)
+	s.recordLearned([]string{"b"}, 500)
 
 	evict := s.EvictionFor("c", []string{"a", "b"})
 	if len(evict) != 1 || evict[0] != "a" {
 		t.Fatalf("evict=%v want [a] (600 + b's reserved 500 = 1100, over the 800 limit)", evict)
+	}
+}
+
+// TestMemoryBudgetSwapper_NoReservationBelowMinSamples checks that a handful
+// of observations aren't trusted yet: reservedForInFlightMB requires
+// minLearnedSamples before using the median, so noise in the first one or two
+// loads can't drive a reservation on its own.
+func TestMemoryBudgetSwapper_NoReservationBelowMinSamples(t *testing.T) {
+	a := newFakeProcess("a")
+	a.testPid = 100
+	a.markReady()
+	b := newFakeProcess("b")
+	b.testPid = 101
+	b.setState(process.StateStarting)
+
+	processes := map[string]process.Process{"a": a, "b": b}
+	s := newTestMemoryBudgetSwapper(800, map[string]int{"a": 1, "b": 10}, processes, 600)
+	// Only 2 observations recorded; minLearnedSamples is 3.
+	s.recordLearned([]string{"b"}, 500)
+	s.recordLearned([]string{"b"}, 500)
+
+	evict := s.EvictionFor("c", []string{"a", "b"})
+	if len(evict) != 0 {
+		t.Fatalf("evict=%v want none (only 2 observations, below minLearnedSamples=3, so b reserves nothing yet)", evict)
+	}
+}
+
+// TestMemoryBudgetSwapper_MedianRejectsOutlier checks the actual point of
+// keeping a history instead of overwriting: a single noisy observation (the
+// unified-memory fallback attributing an unrelated host allocation to a
+// model) must not dominate the reservation the way it would if only the
+// latest value were trusted.
+func TestMemoryBudgetSwapper_MedianRejectsOutlier(t *testing.T) {
+	a := newFakeProcess("a")
+	a.testPid = 100
+	a.markReady()
+	b := newFakeProcess("b")
+	b.testPid = 101
+	b.setState(process.StateStarting)
+
+	processes := map[string]process.Process{"a": a, "b": b}
+	s := newTestMemoryBudgetSwapper(1000, map[string]int{"a": 1, "b": 10}, processes, 600)
+	// b's real footprint is consistently ~200MB, but one load coincided with
+	// an unrelated 5000MB spike elsewhere on the host and got misattributed.
+	s.recordLearned([]string{"b"}, 200)
+	s.recordLearned([]string{"b"}, 5000)
+	s.recordLearned([]string{"b"}, 210)
+	s.recordLearned([]string{"b"}, 195)
+
+	// Median of [200, 5000, 210, 195] sorted -> [195, 200, 210, 5000] -> (200+210)/2 = 205.
+	// 600 + 205 = 805, under the 1000 limit: the outlier must not push this
+	// over, which trusting only the latest (5000) value would have done.
+	evict := s.EvictionFor("c", []string{"a", "b"})
+	if len(evict) != 0 {
+		t.Fatalf("evict=%v want none (median of b's history is ~205MB; the 5000MB outlier must be outvoted, not trusted)", evict)
 	}
 }
 
@@ -448,7 +506,10 @@ func TestMemoryBudgetSwapper_ReadyModelsAreNotReserved(t *testing.T) {
 
 	processes := map[string]process.Process{"a": a}
 	s := newTestMemoryBudgetSwapper(800, map[string]int{"a": 1}, processes, 600)
-	s.recordLearned([]string{"a"}, 500) // stale learned entry from a past load
+	// stale learned history from past loads
+	s.recordLearned([]string{"a"}, 500)
+	s.recordLearned([]string{"a"}, 500)
+	s.recordLearned([]string{"a"}, 500)
 
 	evict := s.EvictionFor("c", []string{"a"})
 	if len(evict) != 0 {
@@ -471,6 +532,8 @@ func TestMemoryBudgetSwapper_StoppingModelsAreNotReserved(t *testing.T) {
 
 	processes := map[string]process.Process{"a": a, "b": b}
 	s := newTestMemoryBudgetSwapper(1000, map[string]int{"a": 1, "b": 10}, processes, 900)
+	s.recordLearned([]string{"b"}, 800)
+	s.recordLearned([]string{"b"}, 800)
 	s.recordLearned([]string{"b"}, 800)
 
 	evict := s.EvictionFor("c", []string{"a", "b"})
@@ -503,6 +566,8 @@ func TestMemoryBudgetSwapper_ShareExcludesReservation(t *testing.T) {
 	// 500MB and stop after a.
 	s := newTestMemoryBudgetSwapper(1000, priority, processes, 900)
 	s.recordLearned([]string{"c"}, 600)
+	s.recordLearned([]string{"c"}, 600)
+	s.recordLearned([]string{"c"}, 600)
 
 	evict := s.EvictionFor("d", []string{"a", "b", "c"})
 	if len(evict) != 2 || evict[0] != "a" || evict[1] != "b" {
@@ -510,10 +575,18 @@ func TestMemoryBudgetSwapper_ShareExcludesReservation(t *testing.T) {
 	}
 }
 
-// TestMemoryBudget_ObserveAndLearnSkipsSysMemSource checks that nothing is
-// learned from the unified-memory fallback, where the sample counts every
-// process on the host and a rise cannot be attributed to a model.
-func TestMemoryBudget_ObserveAndLearnSkipsSysMemSource(t *testing.T) {
+// TestMemoryBudget_ObserveAndLearnRecordsFromSysMemSource checks that the
+// unified-memory fallback source is not blocked from learning outright — the
+// sample it produces counts every process on the host, not only models, so a
+// single observation from it can be noise, but observeAndLearn still records
+// it into the model's history. Robustness against that noise comes from
+// reservedForInFlightMB's median-over-history logic (see
+// TestMemoryBudgetSwapper_MedianRejectsOutlier and
+// TestMemoryBudgetSwapper_NoReservationBelowMinSamples), not from refusing to
+// learn from this source at all — that would throw away real signal along
+// with the noise on any host where VRAM reporting never works (which on a
+// unified-memory host is every host).
+func TestMemoryBudget_ObserveAndLearnRecordsFromSysMemSource(t *testing.T) {
 	a := newFakeProcess("a")
 	a.testPid = 100
 	a.setState(process.StateStarting)
@@ -536,10 +609,10 @@ func TestMemoryBudget_ObserveAndLearnSkipsSysMemSource(t *testing.T) {
 	r.observeAndLearn()
 
 	r.swapper.learnedMu.RLock()
-	_, ok := r.swapper.learned["a"]
+	hist := r.swapper.learned["a"]
 	r.swapper.learnedMu.RUnlock()
-	if ok {
-		t.Fatalf("learned[a] should not be recorded from a system-memory sample")
+	if len(hist) != 1 || hist[0] != 300 {
+		t.Fatalf("learned[a]=%v want [300] (400-100 delta recorded even from a system-memory sample)", hist)
 	}
 }
 
@@ -563,10 +636,10 @@ func TestMemoryBudget_ObserveAndLearnAttributesDelta(t *testing.T) {
 	r.observeAndLearn() // second tick: a transitioned to ready, delta=300
 
 	r.swapper.learnedMu.RLock()
-	got := r.swapper.learned["a"]
+	hist := r.swapper.learned["a"]
 	r.swapper.learnedMu.RUnlock()
-	if got != 300 {
-		t.Fatalf("learned[a]=%d want 300 (400-100 delta attributed to a)", got)
+	if len(hist) != 1 || hist[0] != 300 {
+		t.Fatalf("learned[a]=%v want [300] (400-100 delta attributed to a)", hist)
 	}
 }
 
@@ -596,9 +669,9 @@ func TestMemoryBudget_ObserveAndLearnSplitsDeltaAcrossConcurrentLoads(t *testing
 
 	r.swapper.learnedMu.RLock()
 	defer r.swapper.learnedMu.RUnlock()
-	if r.swapper.learned["a"] != 300 || r.swapper.learned["b"] != 300 {
-		t.Fatalf("learned a=%d b=%d want a=300 b=300 (600 delta split across 2 concurrent loads)",
-			r.swapper.learned["a"], r.swapper.learned["b"])
+	histA, histB := r.swapper.learned["a"], r.swapper.learned["b"]
+	if len(histA) != 1 || histA[0] != 300 || len(histB) != 1 || histB[0] != 300 {
+		t.Fatalf("learned a=%v b=%v want a=[300] b=[300] (600 delta split across 2 concurrent loads)", histA, histB)
 	}
 }
 
