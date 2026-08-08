@@ -143,13 +143,7 @@ func (mb *MemoryBudget) enforceBudgetPeriodically(ctx context.Context) {
 // repeats of the exact burst that caught this blind spot the first time.
 func (mb *MemoryBudget) observeAndLearn() {
 	usedMB, src := mb.swapper.usedMemoryMB()
-	// Only VRAM is clean enough to learn from. The unified-memory fallback
-	// counts every process on the host, so an unrelated allocation during a
-	// load would be recorded as that model's footprint — permanently, since
-	// entries are overwritten only on the model's next observed load — and
-	// then drive reservations and evictions off a number that was never
-	// about the model at all.
-	if src != sourceVRAM {
+	if src == sourceNone {
 		mb.prevOK = false
 		return
 	}
@@ -306,29 +300,70 @@ type memoryBudgetSwapper struct {
 	// hosts, where VRAM reads 0. Defaults to perfMon.SysMemUsedMB.
 	sampleSysMemUsedMB func() (int64, bool)
 
-	// learned is each model's most recently observed footprint in MB, filled
-	// in by observeAndLearn as models finish loading. EvictionFor uses it to
-	// reserve budget for models that are running-but-not-ready (still
-	// loading) so a burst of concurrent loads doesn't all sail through the
-	// "fits without eviction" check against a usedMB sample that predates
-	// every one of them finishing. A model with no entry yet (never observed
-	// loading before) contributes no reservation — see observeAndLearn.
+	// learned holds each model's recent observed footprints in MB (most
+	// recent last, capped at learnedHistoryLen), filled in by observeAndLearn
+	// as models finish loading. EvictionFor reserves budget for models that
+	// are running-but-not-ready (still loading) from the median of a model's
+	// history — see learnedFootprintLocked — so a burst of concurrent loads
+	// doesn't all sail through the "fits without eviction" check against a
+	// usedMB sample that predates every one of them finishing.
+	//
+	// A single observation can be noise rather than signal: usedMemoryMB's
+	// unified-memory fallback counts every process on the host, so an
+	// unrelated allocation (another container, a training job, ...) that
+	// happens to land in the same window as a load gets attributed to that
+	// model. Trusting the latest observation outright — as if every sample
+	// were clean VRAM — would let that noise drive real eviction decisions.
+	// The median of several observations is far more robust: a model's real
+	// footprint recurs every time it loads, so it dominates the median, while
+	// unrelated noise varies and gets outvoted. A model with too few
+	// observations yet (see minLearnedSamples) contributes no reservation,
+	// same as one never observed at all — not enough signal yet to trust.
 	learnedMu sync.RWMutex
-	learned   map[string]int64
+	learned   map[string][]int64
 
 	warnUnified sync.Once
 }
 
-// recordLearned overwrites the learned footprint for each of ids with mb.
+// learnedHistoryLen is how many recent observations recordLearned keeps per
+// model. minLearnedSamples is the minimum before learnedFootprintLocked
+// trusts the median rather than treating the model as unobserved.
+const (
+	learnedHistoryLen = 5
+	minLearnedSamples = 3
+)
+
+// recordLearned appends mb to each of ids' observation history, capped at the
+// most recent learnedHistoryLen entries.
 func (s *memoryBudgetSwapper) recordLearned(ids []string, mb int64) {
 	s.learnedMu.Lock()
 	defer s.learnedMu.Unlock()
 	if s.learned == nil {
-		s.learned = make(map[string]int64, len(ids))
+		s.learned = make(map[string][]int64, len(ids))
 	}
 	for _, id := range ids {
-		s.learned[id] = mb
+		hist := append(s.learned[id], mb)
+		if len(hist) > learnedHistoryLen {
+			hist = hist[len(hist)-learnedHistoryLen:]
+		}
+		s.learned[id] = hist
 	}
+}
+
+// learnedFootprintLocked returns the median of id's observation history, or 0
+// if there are fewer than minLearnedSamples. Callers must hold learnedMu.
+func (s *memoryBudgetSwapper) learnedFootprintLocked(id string) int64 {
+	hist := s.learned[id]
+	if len(hist) < minLearnedSamples {
+		return 0
+	}
+	sorted := append([]int64(nil), hist...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	n := len(sorted)
+	if n%2 == 1 {
+		return sorted[n/2]
+	}
+	return (sorted[n/2-1] + sorted[n/2]) / 2
 }
 
 // reservedForInFlightMB sums the learned footprint of every model in running
@@ -343,9 +378,9 @@ func (s *memoryBudgetSwapper) recordLearned(ids []string, mb int64) {
 // the sample that already has it — inflating usage at exactly the moment an
 // eviction is in progress and cascading into evicting more than needed.
 //
-// Models with no learned entry (never observed loading before) contribute 0:
-// there is no basis for an estimate, so they are silently invisible here,
-// same as the blind spot this exists to shrink but cannot fully close.
+// Models with fewer than minLearnedSamples observations (including none at
+// all) contribute 0: not enough signal yet to trust over noise, same as the
+// blind spot this exists to shrink but cannot fully close.
 func (s *memoryBudgetSwapper) reservedForInFlightMB(running []string) int64 {
 	s.learnedMu.RLock()
 	defer s.learnedMu.RUnlock()
@@ -358,7 +393,7 @@ func (s *memoryBudgetSwapper) reservedForInFlightMB(running []string) int64 {
 		if st := p.State(); st == process.StateReady || st == process.StateStopping {
 			continue
 		}
-		reserved += s.learned[id]
+		reserved += s.learnedFootprintLocked(id)
 	}
 	return reserved
 }
