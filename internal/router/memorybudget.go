@@ -42,8 +42,24 @@ type MemoryBudget struct {
 	prevUsedMB int64
 	prevOK     bool
 
-	warnEvictFreedNothing sync.Once
-	warnLastModelOver     sync.Once
+	// lastEvictReady is the ready-model set at the tick where enforceBudgetOnce
+	// last evicted, alongside lastEvictUsedMB. See enforceBudgetOnce: usage not
+	// dropping since that tick only means eviction isn't helping if the ready
+	// set hasn't changed either. If it has — some other model finished loading
+	// in between — that alone explains a rise that has nothing to do with
+	// whether the eviction worked, and pausing here would disable protection
+	// at exactly the moment a concurrent load burst needs it most.
+	lastEvictReady map[string]bool
+
+	// warnedEvictFreedNothing tracks whether the pause warning already fired
+	// for the current pause episode. Unlike warnLastModelOver (a structural
+	// condition that only a config change resolves, so warning once ever is
+	// enough), a pause episode ends whenever usage drops back under budget —
+	// see the usedMB<=limitMB branch in enforceBudgetOnce, which resets this
+	// alongside lastEvictUsedMB/lastEvictReady so a later, distinct pause
+	// episode warns again instead of logging silently.
+	warnedEvictFreedNothing bool
+	warnLastModelOver       sync.Once
 }
 
 func NewMemoryBudget(conf config.Config, proxylog, upstreamlog *logmon.Monitor, perfMon *perf.Monitor) (*MemoryBudget, error) {
@@ -176,33 +192,42 @@ func (mb *MemoryBudget) enforceBudgetOnce() {
 		// Back under budget: whatever we evicted last worked, so let a
 		// future overshoot evict again.
 		mb.lastEvictUsedMB = 0
+		mb.lastEvictReady = nil
+		mb.warnedEvictFreedNothing = false
 		mb.logger.Debugf("memoryBudget: periodic check usedMB=%d limitMB=%d (under budget)", usedMB, mb.swapper.limitMB)
-		return
-	}
-
-	// An earlier tick evicted and usage has not dropped since, so the memory
-	// over the limit is not held by the models we can evict. That is the
-	// expected shape of the unified-memory fallback in usedMemoryMB, where
-	// the sample counts every process on the host rather than only models:
-	// evicting again would walk through the rest of the running models and
-	// still not get under the limit. Wait for usage to actually drop before
-	// trusting eviction to help again.
-	if mb.lastEvictUsedMB != 0 && usedMB >= mb.lastEvictUsedMB {
-		mb.warnEvictFreedNothing.Do(func() {
-			mb.logger.Warnf("memoryBudget: usedMB=%d limitMB=%d still over budget, and the previous eviction (at %dMB) freed nothing — pausing periodic eviction until usage drops. Memory over the limit is likely held outside the models llama-swap manages.", usedMB, mb.swapper.limitMB, mb.lastEvictUsedMB)
-		})
 		return
 	}
 
 	states := mb.RunningModels()
 	running := make([]string, 0, len(states))
 	ready := make([]string, 0, len(states))
+	readySet := make(map[string]bool, len(states))
 	for id, st := range states {
 		running = append(running, id)
 		if st == process.StateReady {
 			ready = append(ready, id)
+			readySet[id] = true
 		}
 	}
+
+	// An earlier tick evicted and usage has not dropped since — but that only
+	// means eviction isn't helping if the ready set hasn't changed either. A
+	// concurrent load finishing in between raises usedMB for reasons that have
+	// nothing to do with whether the eviction worked, and on a host taking a
+	// burst of loads that can happen every tick — pausing here would disable
+	// protection for as long as the burst continues, exactly when it's needed
+	// most. Only pause when usage sat still AND nothing newly finished loading
+	// to explain it: that combination is the actual signature of memory held
+	// outside the models llama-swap manages (the unified-memory fallback in
+	// usedMemoryMB counts everything on the host, not just models).
+	if mb.lastEvictUsedMB != 0 && usedMB >= mb.lastEvictUsedMB && !hasNewMember(readySet, mb.lastEvictReady) {
+		if !mb.warnedEvictFreedNothing {
+			mb.warnedEvictFreedNothing = true
+			mb.logger.Warnf("memoryBudget: usedMB=%d limitMB=%d still over budget, the ready set is unchanged, and the previous eviction (at %dMB) froze nothing — pausing periodic eviction until usage drops. Memory over the limit is likely held outside the models llama-swap manages.", usedMB, mb.swapper.limitMB, mb.lastEvictUsedMB)
+		}
+		return
+	}
+
 	if len(ready) == 0 {
 		// Over budget with nothing evictable yet (e.g. the only running
 		// model is still starting) — nothing to do until the next tick.
@@ -231,7 +256,22 @@ func (mb *MemoryBudget) enforceBudgetOnce() {
 	}
 	mb.logger.Infof("memoryBudget: periodic check usedMB=%d limitMB=%d evicting=%v (over budget with no new model loading to trigger EvictionFor)", usedMB, mb.swapper.limitMB, evict)
 	mb.lastEvictUsedMB = usedMB
+	mb.lastEvictReady = readySet
 	mb.Unload(0, evict...)
+}
+
+// hasNewMember reports whether current contains any key absent from previous
+// — i.e. something is ready now that wasn't at the last eviction. A ready set
+// that only shrank or stayed the same (the expected shape of eviction taking
+// effect) returns false: only growth signals a concurrent load that could
+// explain a usage rise unrelated to whether the eviction helped.
+func hasNewMember(current, previous map[string]bool) bool {
+	for k := range current {
+		if !previous[k] {
+			return true
+		}
+	}
+	return false
 }
 
 // memoryBudgetSwapper decides evictions by keeping total VRAM used (summed
