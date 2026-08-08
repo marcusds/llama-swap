@@ -1,6 +1,7 @@
 package router
 
 import (
+	"context"
 	"fmt"
 	"slices"
 	"sort"
@@ -13,8 +14,14 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/process"
 )
 
+// memoryBudgetCheckInterval is how often enforceBudgetPeriodically re-samples
+// usage independent of any swap. See that method's doc comment for why this
+// exists alongside the swap-start check in EvictionFor.
+const memoryBudgetCheckInterval = 15 * time.Second
+
 type MemoryBudget struct {
 	*baseRouter
+	swapper *memoryBudgetSwapper
 }
 
 func NewMemoryBudget(conf config.Config, proxylog, upstreamlog *logmon.Monitor, perfMon *perf.Monitor) (*MemoryBudget, error) {
@@ -57,9 +64,68 @@ func NewMemoryBudget(conf config.Config, proxylog, upstreamlog *logmon.Monitor, 
 		processes[mid] = p
 	}
 
-	r := &MemoryBudget{baseRouter: base}
+	r := &MemoryBudget{baseRouter: base, swapper: swapper}
 	go base.run()
+	go r.enforceBudgetPeriodically(base.procCtx)
 	return r, nil
+}
+
+// enforceBudgetPeriodically re-checks usage on a timer and evicts even when no
+// new model is loading.
+//
+// EvictionFor only runs at swap-start, and it samples usage *before* the
+// incoming model finishes loading — so the model that actually tips the host
+// over budget is never itself weighed against the limit. If nothing else
+// tries to load afterwards, there is no other trigger that would notice, and
+// the host just sits over budget (see the memoryBudgetSwapper doc comment for
+// why per-model footprint can't be predicted ahead of a load to fix this at
+// admission time instead). This closes that gap by checking independent of
+// swap events.
+func (mb *MemoryBudget) enforceBudgetPeriodically(ctx context.Context) {
+	ticker := time.NewTicker(memoryBudgetCheckInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			mb.enforceBudgetOnce()
+		}
+	}
+}
+
+func (mb *MemoryBudget) enforceBudgetOnce() {
+	usedMB, ok := mb.swapper.usedMemoryMB()
+	if !ok {
+		return
+	}
+	if usedMB <= mb.swapper.limitMB {
+		mb.logger.Debugf("memoryBudget: periodic check usedMB=%d limitMB=%d (under budget)", usedMB, mb.swapper.limitMB)
+		return
+	}
+
+	states := mb.RunningModels()
+	running := make([]string, 0, len(states))
+	ready := make([]string, 0, len(states))
+	for id, st := range states {
+		running = append(running, id)
+		if st == process.StateReady {
+			ready = append(ready, id)
+		}
+	}
+	if len(ready) == 0 {
+		// Over budget with nothing evictable yet (e.g. the only running
+		// model is still starting) — nothing to do until the next tick.
+		mb.logger.Debugf("memoryBudget: periodic check usedMB=%d limitMB=%d over budget but no ready model to evict yet", usedMB, mb.swapper.limitMB)
+		return
+	}
+
+	evict := mb.swapper.pickEvictions(ready, usedMB, len(running))
+	if len(evict) == 0 {
+		return
+	}
+	mb.logger.Infof("memoryBudget: periodic check usedMB=%d limitMB=%d evicting=%v (over budget with no new model loading to trigger EvictionFor)", usedMB, mb.swapper.limitMB, evict)
+	mb.Unload(0, evict...)
 }
 
 // memoryBudgetSwapper decides evictions by keeping total VRAM used (summed
@@ -134,22 +200,39 @@ func (s *memoryBudgetSwapper) EvictionFor(target string, running []string) []str
 		return nil
 	}
 
-	candidates := make([]string, len(running))
-	copy(candidates, running)
-	sort.Slice(candidates, func(i, j int) bool {
-		pi, pj := s.priority[candidates[i]], s.priority[candidates[j]]
+	return s.pickEvictions(running, usedMB, len(running))
+}
+
+// pickEvictions greedily selects the lowest-priority (ties broken by
+// least-recently-used) models from candidates until usedMB, decremented by an
+// equal share per eviction, would drop to or below the limit. shareDivisor is
+// the size of the pool the share is computed against — usually len(candidates),
+// but callers evicting from a subset of the running set (e.g. periodic
+// enforcement skipping still-starting processes) pass the full running count
+// so the assumed per-model share stays accurate.
+//
+// VRAM isn't attributed per model (see the memoryBudgetSwapper doc comment),
+// so each eviction is assumed to free an equal share of the total currently
+// used.
+func (s *memoryBudgetSwapper) pickEvictions(candidates []string, usedMB int64, shareDivisor int) []string {
+	if shareDivisor == 0 {
+		return nil
+	}
+
+	sorted := make([]string, len(candidates))
+	copy(sorted, candidates)
+	sort.Slice(sorted, func(i, j int) bool {
+		pi, pj := s.priority[sorted[i]], s.priority[sorted[j]]
 		if pi != pj {
 			return pi < pj
 		}
-		return s.lastUseOf(candidates[i]).Before(s.lastUseOf(candidates[j]))
+		return s.lastUseOf(sorted[i]).Before(s.lastUseOf(sorted[j]))
 	})
 
-	// VRAM isn't attributed per model, so each eviction is assumed to free
-	// an equal share of the total currently used.
-	shareMB := usedMB / int64(len(running))
+	shareMB := usedMB / int64(shareDivisor)
 
 	var evict []string
-	for _, m := range candidates {
+	for _, m := range sorted {
 		if usedMB <= s.limitMB {
 			break
 		}
