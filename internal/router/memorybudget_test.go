@@ -73,6 +73,37 @@ func TestMemoryBudgetSwapper_NoSampleAvailable(t *testing.T) {
 	}
 }
 
+// Unified-memory hosts (NVIDIA Grace-Blackwell GB10, for example) report 0MB
+// used to nvidia-smi because there is no separate framebuffer. The budget then
+// applies to system memory used instead of reading the 0 as "nothing loaded".
+func TestMemoryBudgetSwapper_FallsBackToSystemMemory(t *testing.T) {
+	a := newFakeProcess("a")
+	a.testPid = 100
+	a.markReady()
+	processes := map[string]process.Process{"a": a}
+	s := newTestMemoryBudgetSwapper(1000, nil, processes, 0)
+	s.sampleSysMemUsedMB = func() (int64, bool) { return 1200, true }
+
+	evict := s.EvictionFor("b", []string{"a"})
+	if len(evict) != 1 || evict[0] != "a" {
+		t.Errorf("evict=%v want [a] (system memory over limit when VRAM reads 0)", evict)
+	}
+}
+
+func TestMemoryBudgetSwapper_NoSampleFromEitherSource(t *testing.T) {
+	a := newFakeProcess("a")
+	a.testPid = 100
+	a.markReady()
+	processes := map[string]process.Process{"a": a}
+	s := newTestMemoryBudgetSwapper(1000, nil, processes, 0)
+	s.sampleSysMemUsedMB = func() (int64, bool) { return 0, false }
+
+	evict := s.EvictionFor("b", []string{"a"})
+	if len(evict) != 0 {
+		t.Errorf("evict=%v want none (no memory sample available)", evict)
+	}
+}
+
 func TestMemoryBudgetSwapper_EvictsLowestPriorityFirst(t *testing.T) {
 	a := newFakeProcess("a")
 	a.testPid = 100

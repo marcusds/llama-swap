@@ -619,6 +619,14 @@ matrix:
 # per-process breakdown across vendors, so each evicted model is assumed to
 # free an equal share of the total.
 #
+# Hosts with unified CPU/GPU memory (NVIDIA Grace-Blackwell GB10, for example)
+# have no separate framebuffer, so nvidia-smi reports 0MB used even while
+# models are resident. There the pool being budgeted is system RAM, so a 0MB
+# VRAM reading falls back to system memory used (the same figure `free`
+# reports as used) and logs a warning once. Set limit against total system
+# memory on those hosts, and leave headroom: system memory used counts
+# everything on the host, not only models.
+#
 # Solver behavior (runs when a model is requested):
 #   1. If the requested model is already running, forward immediately. Done.
 #   2. If current total VRAM used fits under limit, no eviction needed. Start

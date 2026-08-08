@@ -224,6 +224,19 @@ func (m *Monitor) VRAMUsedMB() (mb int64, ok bool) {
 	return total, true
 }
 
+// SysMemUsedMB returns system memory used in MB from the latest sample (the
+// same figure as `free`'s used column: excludes buffers and cache). ok is
+// false if no system stats have been recorded yet.
+func (m *Monitor) SysMemUsedMB() (mb int64, ok bool) {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+	s, ok := m.sysRing.Last()
+	if !ok {
+		return 0, false
+	}
+	return int64(s.MemUsedMB), true
+}
+
 func ReadSysStats() (SysStat, error) {
 	return readSysStats()
 }
