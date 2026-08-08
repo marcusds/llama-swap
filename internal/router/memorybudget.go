@@ -22,6 +22,17 @@ const memoryBudgetCheckInterval = 15 * time.Second
 type MemoryBudget struct {
 	*baseRouter
 	swapper *memoryBudgetSwapper
+
+	// lastEvictUsedMB is the usage sampled at the tick where
+	// enforceBudgetOnce last evicted, or 0 when the last tick evicted
+	// nothing. See enforceBudgetOnce for why a later tick that measures no
+	// drop must not evict again. Only touched by the single
+	// enforceBudgetPeriodically goroutine (and by tests, serially), so it
+	// needs no synchronization.
+	lastEvictUsedMB int64
+
+	warnEvictFreedNothing sync.Once
+	warnLastModelOver     sync.Once
 }
 
 func NewMemoryBudget(conf config.Config, proxylog, upstreamlog *logmon.Monitor, perfMon *perf.Monitor) (*MemoryBudget, error) {
@@ -100,7 +111,24 @@ func (mb *MemoryBudget) enforceBudgetOnce() {
 		return
 	}
 	if usedMB <= mb.swapper.limitMB {
+		// Back under budget: whatever we evicted last worked, so let a
+		// future overshoot evict again.
+		mb.lastEvictUsedMB = 0
 		mb.logger.Debugf("memoryBudget: periodic check usedMB=%d limitMB=%d (under budget)", usedMB, mb.swapper.limitMB)
+		return
+	}
+
+	// An earlier tick evicted and usage has not dropped since, so the memory
+	// over the limit is not held by the models we can evict. That is the
+	// expected shape of the unified-memory fallback in usedMemoryMB, where
+	// the sample counts every process on the host rather than only models:
+	// evicting again would walk through the rest of the running models and
+	// still not get under the limit. Wait for usage to actually drop before
+	// trusting eviction to help again.
+	if mb.lastEvictUsedMB != 0 && usedMB >= mb.lastEvictUsedMB {
+		mb.warnEvictFreedNothing.Do(func() {
+			mb.logger.Warnf("memoryBudget: usedMB=%d limitMB=%d still over budget, and the previous eviction (at %dMB) freed nothing — pausing periodic eviction until usage drops. Memory over the limit is likely held outside the models llama-swap manages.", usedMB, mb.swapper.limitMB, mb.lastEvictUsedMB)
+		})
 		return
 	}
 
@@ -121,10 +149,24 @@ func (mb *MemoryBudget) enforceBudgetOnce() {
 	}
 
 	evict := mb.swapper.pickEvictions(ready, usedMB, len(running))
+
+	// Never evict every running model. EvictionFor gets this for free — the
+	// incoming target is not in its candidate list, so something always
+	// survives — but periodic enforcement has no incoming model, and a
+	// single model whose own footprint exceeds the limit would otherwise be
+	// killed here, reloaded by the next request, and killed again a tick
+	// later, forever.
+	if maxEvict := len(running) - 1; len(evict) > maxEvict {
+		evict = evict[:maxEvict]
+	}
 	if len(evict) == 0 {
+		mb.warnLastModelOver.Do(func() {
+			mb.logger.Warnf("memoryBudget: usedMB=%d limitMB=%d over budget with only one model running — keeping it rather than evicting into an empty host. Raise the limit or lower the model's memory use.", usedMB, mb.swapper.limitMB)
+		})
 		return
 	}
 	mb.logger.Infof("memoryBudget: periodic check usedMB=%d limitMB=%d evicting=%v (over budget with no new model loading to trigger EvictionFor)", usedMB, mb.swapper.limitMB, evict)
+	mb.lastEvictUsedMB = usedMB
 	mb.Unload(0, evict...)
 }
 
