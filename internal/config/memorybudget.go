@@ -95,6 +95,24 @@ func parseMemorySize(s string) (int64, error) {
 	return mb, nil
 }
 
+// MergeModelPriorities folds per-model `priority:` settings into
+// mb.Models so the router only has to consult one map. An explicit entry
+// under memoryBudget.models wins over the model's own `priority:` field.
+func MergeModelPriorities(mb *MemoryBudgetConfig, models map[string]ModelConfig) {
+	for modelID, modelConfig := range models {
+		if modelConfig.Priority == nil {
+			continue
+		}
+		if _, exists := mb.Models[modelID]; exists {
+			continue
+		}
+		if mb.Models == nil {
+			mb.Models = make(map[string]MemoryBudgetModel)
+		}
+		mb.Models[modelID] = MemoryBudgetModel{Priority: *modelConfig.Priority}
+	}
+}
+
 // ValidateMemoryBudget validates the memoryBudget config block.
 func ValidateMemoryBudget(mb MemoryBudgetConfig, models map[string]ModelConfig) error {
 	if mb.Limit.MB() <= 0 {
