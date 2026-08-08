@@ -15,9 +15,26 @@ import (
 )
 
 // memoryBudgetCheckInterval is how often enforceBudgetPeriodically re-samples
-// usage independent of any swap. See that method's doc comment for why this
-// exists alongside the swap-start check in EvictionFor.
-const memoryBudgetCheckInterval = 15 * time.Second
+// usage independent of any swap, when nothing is actively loading. See that
+// method's doc comment for why this exists alongside the swap-start check in
+// EvictionFor.
+//
+// memoryBudgetActiveLoadCheckInterval is the tighter interval used instead
+// while at least one model is StateStarting. A load can push usage from under
+// budget to well over it in well under 15s, and the fixed interval leaves
+// that entire window unmonitored between ticks — which is exactly the shape
+// of the incident that motivated this: usage climbed to under 1GB free while
+// a load was in flight, with the periodic check having no reason to look
+// again for several more seconds. Checking more often only while a load is
+// actually in progress also gives observeAndLearn a tighter, cleaner
+// before/after window per tick — less time for unrelated host activity to
+// leak into a delta it's trying to attribute to a model (see the learned
+// field's doc comment on memoryBudgetSwapper for why that matters on the
+// unified-memory fallback).
+const (
+	memoryBudgetCheckInterval           = 15 * time.Second
+	memoryBudgetActiveLoadCheckInterval = 2 * time.Second
+)
 
 type MemoryBudget struct {
 	*baseRouter
@@ -120,17 +137,31 @@ func NewMemoryBudget(conf config.Config, proxylog, upstreamlog *logmon.Monitor, 
 // admission time instead). This closes that gap by checking independent of
 // swap events.
 func (mb *MemoryBudget) enforceBudgetPeriodically(ctx context.Context) {
-	ticker := time.NewTicker(memoryBudgetCheckInterval)
-	defer ticker.Stop()
+	timer := time.NewTimer(memoryBudgetCheckInterval)
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-timer.C:
 			mb.observeAndLearn()
 			mb.enforceBudgetOnce()
+			timer.Reset(mb.nextCheckInterval())
 		}
 	}
+}
+
+// nextCheckInterval returns memoryBudgetActiveLoadCheckInterval if any model
+// is currently StateStarting, else memoryBudgetCheckInterval. Called after
+// each tick's work, so the tightened cadence takes effect for the tick
+// immediately following whatever just started loading.
+func (mb *MemoryBudget) nextCheckInterval() time.Duration {
+	for _, st := range mb.RunningModels() {
+		if st == process.StateStarting {
+			return memoryBudgetActiveLoadCheckInterval
+		}
+	}
+	return memoryBudgetCheckInterval
 }
 
 // observeAndLearn updates each model's learned footprint (see the learned
