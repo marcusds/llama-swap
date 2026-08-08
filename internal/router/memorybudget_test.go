@@ -629,3 +629,44 @@ func TestMemoryBudget_ObserveAndLearnSkipsNonPositiveDelta(t *testing.T) {
 		t.Fatalf("learned[a] should not be recorded from a non-positive delta")
 	}
 }
+
+// TestMemoryBudget_EnforceBudgetOnceResumesWhenNewLoadExplainsTheRise covers
+// the false-pause bug: usage rising since the last eviction does not mean the
+// eviction failed if a concurrent load finished in between and explains the
+// rise on its own. Pausing in that case disables protection for as long as
+// the burst continues — exactly when it's needed most.
+func TestMemoryBudget_EnforceBudgetOnceResumesWhenNewLoadExplainsTheRise(t *testing.T) {
+	a := newFakeProcess("a")
+	a.testPid = 100
+	a.markReady()
+	b := newFakeProcess("b")
+	b.testPid = 101
+	b.markReady()
+	c := newFakeProcess("c")
+	c.testPid = 102
+	c.setState(process.StateStarting) // not ready at the first tick
+
+	conf := config.Config{
+		HealthCheckTimeout: 5,
+		MemoryBudget:       &config.MemoryBudgetConfig{Limit: 1000},
+	}
+	var usedMB atomic.Int64
+	usedMB.Store(1200)
+	processes := map[string]process.Process{"a": a, "b": b, "c": c}
+	r := newTestMemoryBudgetWithUsage(t, conf, map[string]int{"a": 1, "b": 2, "c": 3}, processes, &usedMB)
+
+	r.enforceBudgetOnce()
+	if got := a.stopCalls.Load(); got != 1 {
+		t.Fatalf("a.stopCalls=%d want 1 on the first tick", got)
+	}
+
+	// Second tick: usage rose instead of dropping, but "c" finished loading
+	// in between (a legitimate new member of the ready set) — that alone
+	// explains the rise, so eviction must not be treated as having failed.
+	c.markReady()
+	usedMB.Store(1400)
+	r.enforceBudgetOnce()
+	if got := b.stopCalls.Load(); got != 1 {
+		t.Errorf("b.stopCalls=%d want 1 (c finishing loading explains the rise, so eviction resumes rather than pausing)", got)
+	}
+}
