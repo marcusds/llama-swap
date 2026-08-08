@@ -456,6 +456,93 @@ func TestMemoryBudgetSwapper_ReadyModelsAreNotReserved(t *testing.T) {
 	}
 }
 
+// TestMemoryBudgetSwapper_StoppingModelsAreNotReserved checks that a model on
+// its way out is not reserved for. runningSet includes StateStopping models,
+// whose memory is still in the usedMB sample and about to be freed — adding a
+// reservation on top would double-count them and cascade into evicting more
+// than the budget actually calls for.
+func TestMemoryBudgetSwapper_StoppingModelsAreNotReserved(t *testing.T) {
+	a := newFakeProcess("a")
+	a.testPid = 100
+	a.markReady()
+	b := newFakeProcess("b")
+	b.testPid = 101
+	b.setState(process.StateStopping) // already being evicted by another swap
+
+	processes := map[string]process.Process{"a": a, "b": b}
+	s := newTestMemoryBudgetSwapper(1000, map[string]int{"a": 1, "b": 10}, processes, 900)
+	s.recordLearned([]string{"b"}, 800)
+
+	evict := s.EvictionFor("c", []string{"a", "b"})
+	if len(evict) != 0 {
+		t.Fatalf("evict=%v want none (b is stopping: its 800MB is already in usedMB=900 and about to be freed, not a load to reserve for)", evict)
+	}
+}
+
+// TestMemoryBudgetSwapper_ShareExcludesReservation checks that the assumed
+// per-eviction yield comes from the sampled usage only. Reserved memory
+// belongs to models that have not loaded yet, so evicting a ready model
+// cannot free any of it.
+func TestMemoryBudgetSwapper_ShareExcludesReservation(t *testing.T) {
+	a := newFakeProcess("a")
+	a.testPid = 100
+	a.markReady()
+	b := newFakeProcess("b")
+	b.testPid = 101
+	b.markReady()
+	c := newFakeProcess("c")
+	c.testPid = 102
+	c.setState(process.StateStarting)
+
+	processes := map[string]process.Process{"a": a, "b": b, "c": c}
+	priority := map[string]int{"a": 1, "b": 2, "c": 10}
+	// sampled=900 over 3 running models is a 300MB share each; c reserves a
+	// further 600MB, for 1500MB against a 1000MB limit. Evicting a alone
+	// frees ~300 (1200, still over), so b must go too. Folding the
+	// reservation into the share would make each eviction look like it frees
+	// 500MB and stop after a.
+	s := newTestMemoryBudgetSwapper(1000, priority, processes, 900)
+	s.recordLearned([]string{"c"}, 600)
+
+	evict := s.EvictionFor("d", []string{"a", "b", "c"})
+	if len(evict) != 2 || evict[0] != "a" || evict[1] != "b" {
+		t.Fatalf("evict=%v want [a b] (300MB share from the 900MB sample, not 500MB from sample+reservation)", evict)
+	}
+}
+
+// TestMemoryBudget_ObserveAndLearnSkipsSysMemSource checks that nothing is
+// learned from the unified-memory fallback, where the sample counts every
+// process on the host and a rise cannot be attributed to a model.
+func TestMemoryBudget_ObserveAndLearnSkipsSysMemSource(t *testing.T) {
+	a := newFakeProcess("a")
+	a.testPid = 100
+	a.setState(process.StateStarting)
+
+	conf := config.Config{
+		HealthCheckTimeout: 5,
+		MemoryBudget:       &config.MemoryBudgetConfig{Limit: 1000},
+	}
+	var usedMB atomic.Int64
+	usedMB.Store(100)
+	r := newTestMemoryBudgetWithUsage(t, conf, map[string]int{"a": 1}, map[string]process.Process{"a": a}, &usedMB)
+	// VRAM reads 0, so usedMemoryMB falls back to system memory.
+	r.swapper.sampleVRAMUsedMB = func() (int64, bool) { return 0, true }
+	r.swapper.sampleSysMemUsedMB = func() (int64, bool) { return usedMB.Load(), true }
+
+	r.observeAndLearn()
+
+	a.markReady()
+	usedMB.Store(400) // could be the model, could be anything else on the host
+	r.observeAndLearn()
+
+	r.swapper.learnedMu.RLock()
+	_, ok := r.swapper.learned["a"]
+	r.swapper.learnedMu.RUnlock()
+	if ok {
+		t.Fatalf("learned[a] should not be recorded from a system-memory sample")
+	}
+}
+
 func TestMemoryBudget_ObserveAndLearnAttributesDelta(t *testing.T) {
 	a := newFakeProcess("a")
 	a.testPid = 100
