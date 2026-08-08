@@ -145,7 +145,7 @@
                 },
                 "models": {
                     "type": "object",
-                    "description": "Per-model eviction priority. Keys must be model IDs defined in models. Models not listed default to priority: 0.",
+                    "description": "Per-model eviction priority. Keys must be model IDs defined in models. Models not listed default to priority: 0, unless the model sets its own top-level priority field. Entries here take precedence over a model's own priority field.",
                     "additionalProperties": {
                         "type": "object",
                         "properties": {
@@ -587,6 +587,11 @@
                         "type": "boolean",
                         "default": false,
                         "description": "If true the model will not show up in /v1/models responses. It can still be used as normal in API requests."
+                    },
+                    "priority": {
+                        "type": "integer",
+                        "default": 0,
+                        "description": "memoryBudget eviction priority. Higher priority models are evicted last, ties broken by least-recently-used. Only used when the memoryBudget router is active. An entry for this model under memoryBudget.models takes precedence."
                     },
                     "timeouts": {
                         "$ref": "#/definitions/timeouts"

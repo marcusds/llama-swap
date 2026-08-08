@@ -451,6 +451,17 @@ models:
     unlisted: true
     cmd: llama-server --port ${PORT} -m Llama-3.2-1B-Instruct-Q4_K_M.gguf -ngl 0
 
+  # memoryBudget priority example:
+  "priority-model":
+    # priority: eviction priority for the memoryBudget router
+    # - optional, default: 0
+    # - only used when the memoryBudget router is active
+    # - higher priority models are evicted last, ties broken by
+    #   least-recently-used
+    # - an entry for this model under memoryBudget.models wins over this field
+    priority: 10
+    cmd: llama-server --port ${PORT} -m Llama-3.2-1B-Instruct-Q4_K_M.gguf
+
   # Docker example:
   # container runtimes like Docker and Podman can be used reliably with
   # a combination of cmd, cmdStop, and ${MODEL_ID}
@@ -683,6 +694,14 @@ routing:
       #
       # limit accepts a bare number (megabytes) or a human-readable string
       # with a unit suffix: B, KB, MB, GB, TB (e.g. "512MB", "8GB", "1TB").
+      #
+      # Priorities can be set two ways, and both can be mixed in one config:
+      #   1. In the memoryBudget.models block below.
+      #   2. As a `priority:` field on the model itself, in the models
+      #      section. Handy when priorities are easier to maintain next to
+      #      the model they belong to.
+      # If a model appears in both places the memoryBudget.models entry wins.
+      # Models with no priority anywhere default to 0.
       memoryBudget:
         limit: 24GB
 

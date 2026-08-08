@@ -230,6 +230,7 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 			return Config{}, fmt.Errorf("matrix: %w", err)
 		}
 	} else if config.MemoryBudget != nil {
+		MergeModelPriorities(config.MemoryBudget, config.Models)
 		if err := ValidateMemoryBudget(*config.MemoryBudget, config.Models); err != nil {
 			return Config{}, fmt.Errorf("memoryBudget: %w", err)
 		}

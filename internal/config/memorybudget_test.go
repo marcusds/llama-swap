@@ -133,3 +133,84 @@ func TestParseMemorySize(t *testing.T) {
 		assert.Equal(t, tt.wantMB, mb, tt.in)
 	}
 }
+
+func TestMergeModelPriorities_FromModelConfig(t *testing.T) {
+	p10, p3 := 10, 3
+	models := makeModels("gemma", "qwen", "mistral")
+	models["gemma"] = ModelConfig{Cmd: "echo gemma", Priority: &p10}
+	models["qwen"] = ModelConfig{Cmd: "echo qwen", Priority: &p3}
+
+	mb := MemoryBudgetConfig{Limit: 16000}
+	MergeModelPriorities(&mb, models)
+
+	assert.Equal(t, 10, mb.Models["gemma"].Priority)
+	assert.Equal(t, 3, mb.Models["qwen"].Priority)
+
+	// models without a priority are not added, and default to 0 at lookup
+	_, found := mb.Models["mistral"]
+	assert.False(t, found)
+
+	require.NoError(t, ValidateMemoryBudget(mb, models))
+}
+
+func TestMergeModelPriorities_BudgetBlockWins(t *testing.T) {
+	p1 := 1
+	models := makeModels("gemma")
+	models["gemma"] = ModelConfig{Cmd: "echo gemma", Priority: &p1}
+
+	mb := MemoryBudgetConfig{
+		Limit:  16000,
+		Models: map[string]MemoryBudgetModel{"gemma": {Priority: 99}},
+	}
+	MergeModelPriorities(&mb, models)
+
+	assert.Equal(t, 99, mb.Models["gemma"].Priority)
+}
+
+func TestMergeModelPriorities_ZeroIsExplicit(t *testing.T) {
+	zero := 0
+	models := makeModels("gemma")
+	models["gemma"] = ModelConfig{Cmd: "echo gemma", Priority: &zero}
+
+	mb := MemoryBudgetConfig{Limit: 16000}
+	MergeModelPriorities(&mb, models)
+
+	entry, found := mb.Models["gemma"]
+	require.True(t, found)
+	assert.Equal(t, 0, entry.Priority)
+}
+
+func TestMemoryBudget_ModelLevelPriorityFromYAML(t *testing.T) {
+	cfg, err := LoadConfigFromReader(strings.NewReader(`
+memoryBudget:
+  limit: 90GB
+  models:
+    mistral:
+      priority: 7
+
+models:
+  gemma:
+    cmd: echo gemma ${PORT}
+    priority: 10
+  qwen:
+    cmd: echo qwen ${PORT}
+    priority: 5
+  mistral:
+    cmd: echo mistral ${PORT}
+    priority: 1
+  llama:
+    cmd: echo llama ${PORT}
+`))
+	require.NoError(t, err)
+
+	mb := cfg.Routing.Router.Settings.MemoryBudget
+	require.NotNil(t, mb)
+	assert.Equal(t, int64(90*1024), mb.Limit.MB())
+	assert.Equal(t, 10, mb.Models["gemma"].Priority)
+	assert.Equal(t, 5, mb.Models["qwen"].Priority)
+	// memoryBudget.models entry wins over the model's own priority
+	assert.Equal(t, 7, mb.Models["mistral"].Priority)
+
+	_, found := mb.Models["llama"]
+	assert.False(t, found)
+}

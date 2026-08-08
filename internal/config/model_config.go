@@ -102,6 +102,12 @@ type ModelConfig struct {
 	// Capabilities defines what modalities and features the model supports.
 	Capabilities ModelCapConfig `yaml:"capabilities"`
 
+	// Priority is the memoryBudget eviction priority for this model. Higher
+	// priority models are evicted last. Only used by the memoryBudget router.
+	// nil means unset, which the memoryBudget router treats as priority 0.
+	// An entry in memoryBudget.models for the same model takes precedence.
+	Priority *int `yaml:"priority"`
+
 	// Copy of HealthCheckTimeout from global config
 	HealthCheckTimeout int `yaml:"healthCheckTimeout"`
 }
