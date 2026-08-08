@@ -388,3 +388,157 @@ func TestMemoryBudget_SwapEvictsLowerPriority(t *testing.T) {
 		t.Errorf("b.runCalls=%d want 1", got)
 	}
 }
+
+// TestMemoryBudgetSwapper_ReservesForInFlightLoads covers the concurrent-load
+// blind spot: EvictionFor's usedMB sample never includes a model that hasn't
+// finished loading yet, so a burst of concurrent loads can each individually
+// look like they fit. A learned footprint for a still-loading model closes
+// that gap for repeat loads of the same model.
+func TestMemoryBudgetSwapper_ReservesForInFlightLoads(t *testing.T) {
+	a := newFakeProcess("a")
+	a.testPid = 100
+	a.markReady()
+	b := newFakeProcess("b")
+	b.testPid = 101
+	b.setState(process.StateStarting) // committed (in running) but not yet resident
+
+	processes := map[string]process.Process{"a": a, "b": b}
+	priority := map[string]int{"a": 1, "b": 10}
+	// usedMB=600 reflects only "a" — "b" is mid-load and hasn't shown up in
+	// the sample yet. Without a reservation this looks like it fits under
+	// the 800 limit.
+	s := newTestMemoryBudgetSwapper(800, priority, processes, 600)
+	s.recordLearned([]string{"b"}, 500) // b previously observed costing ~500MB
+
+	evict := s.EvictionFor("c", []string{"a", "b"})
+	if len(evict) != 1 || evict[0] != "a" {
+		t.Fatalf("evict=%v want [a] (600 + b's reserved 500 = 1100, over the 800 limit)", evict)
+	}
+}
+
+// TestMemoryBudgetSwapper_NoReservationWithoutPriorObservation documents the
+// remaining blind spot: a model that has never finished loading before has no
+// learned entry, so it contributes no reservation and the very first
+// concurrent load of it is still invisible to EvictionFor.
+func TestMemoryBudgetSwapper_NoReservationWithoutPriorObservation(t *testing.T) {
+	a := newFakeProcess("a")
+	a.testPid = 100
+	a.markReady()
+	b := newFakeProcess("b")
+	b.testPid = 101
+	b.setState(process.StateStarting)
+
+	processes := map[string]process.Process{"a": a, "b": b}
+	s := newTestMemoryBudgetSwapper(800, map[string]int{"a": 1, "b": 10}, processes, 600)
+	// No recordLearned call for b: this is its first-ever observed load.
+
+	evict := s.EvictionFor("c", []string{"a", "b"})
+	if len(evict) != 0 {
+		t.Fatalf("evict=%v want none (b has no learned footprint yet, so it reserves nothing)", evict)
+	}
+}
+
+// TestMemoryBudgetSwapper_ReadyModelsAreNotReserved checks that only
+// not-yet-ready models draw a reservation — a model already counted in usedMB
+// must not also have its learned footprint added on top.
+func TestMemoryBudgetSwapper_ReadyModelsAreNotReserved(t *testing.T) {
+	a := newFakeProcess("a")
+	a.testPid = 100
+	a.markReady()
+
+	processes := map[string]process.Process{"a": a}
+	s := newTestMemoryBudgetSwapper(800, map[string]int{"a": 1}, processes, 600)
+	s.recordLearned([]string{"a"}, 500) // stale learned entry from a past load
+
+	evict := s.EvictionFor("c", []string{"a"})
+	if len(evict) != 0 {
+		t.Fatalf("evict=%v want none (a is already ready and counted in usedMB=600; its learned footprint must not be double-counted)", evict)
+	}
+}
+
+func TestMemoryBudget_ObserveAndLearnAttributesDelta(t *testing.T) {
+	a := newFakeProcess("a")
+	a.testPid = 100
+	a.setState(process.StateStarting)
+
+	conf := config.Config{
+		HealthCheckTimeout: 5,
+		MemoryBudget:       &config.MemoryBudgetConfig{Limit: 1000},
+	}
+	var usedMB atomic.Int64
+	usedMB.Store(100)
+	r := newTestMemoryBudgetWithUsage(t, conf, map[string]int{"a": 1}, map[string]process.Process{"a": a}, &usedMB)
+
+	r.observeAndLearn() // first tick: establishes the baseline, a not ready yet
+
+	a.markReady()
+	usedMB.Store(400)
+	r.observeAndLearn() // second tick: a transitioned to ready, delta=300
+
+	r.swapper.learnedMu.RLock()
+	got := r.swapper.learned["a"]
+	r.swapper.learnedMu.RUnlock()
+	if got != 300 {
+		t.Fatalf("learned[a]=%d want 300 (400-100 delta attributed to a)", got)
+	}
+}
+
+func TestMemoryBudget_ObserveAndLearnSplitsDeltaAcrossConcurrentLoads(t *testing.T) {
+	a := newFakeProcess("a")
+	a.testPid = 100
+	a.setState(process.StateStarting)
+	b := newFakeProcess("b")
+	b.testPid = 101
+	b.setState(process.StateStarting)
+
+	conf := config.Config{
+		HealthCheckTimeout: 5,
+		MemoryBudget:       &config.MemoryBudgetConfig{Limit: 1000},
+	}
+	var usedMB atomic.Int64
+	usedMB.Store(100)
+	r := newTestMemoryBudgetWithUsage(t, conf, map[string]int{"a": 1, "b": 1}, map[string]process.Process{"a": a, "b": b}, &usedMB)
+
+	r.observeAndLearn()
+
+	a.markReady()
+	b.markReady()
+	usedMB.Store(700) // both became ready between ticks; 600 delta split evenly
+
+	r.observeAndLearn()
+
+	r.swapper.learnedMu.RLock()
+	defer r.swapper.learnedMu.RUnlock()
+	if r.swapper.learned["a"] != 300 || r.swapper.learned["b"] != 300 {
+		t.Fatalf("learned a=%d b=%d want a=300 b=300 (600 delta split across 2 concurrent loads)",
+			r.swapper.learned["a"], r.swapper.learned["b"])
+	}
+}
+
+func TestMemoryBudget_ObserveAndLearnSkipsNonPositiveDelta(t *testing.T) {
+	a := newFakeProcess("a")
+	a.testPid = 100
+	a.setState(process.StateStarting)
+
+	conf := config.Config{
+		HealthCheckTimeout: 5,
+		MemoryBudget:       &config.MemoryBudgetConfig{Limit: 1000},
+	}
+	var usedMB atomic.Int64
+	usedMB.Store(500)
+	r := newTestMemoryBudgetWithUsage(t, conf, map[string]int{"a": 1}, map[string]process.Process{"a": a}, &usedMB)
+
+	r.observeAndLearn()
+
+	a.markReady()
+	usedMB.Store(300) // usage fell between ticks (e.g. something else was evicted)
+
+	r.observeAndLearn()
+
+	r.swapper.learnedMu.RLock()
+	_, ok := r.swapper.learned["a"]
+	r.swapper.learnedMu.RUnlock()
+	if ok {
+		t.Fatalf("learned[a] should not be recorded from a non-positive delta")
+	}
+}

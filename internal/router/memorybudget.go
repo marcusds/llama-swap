@@ -31,6 +31,17 @@ type MemoryBudget struct {
 	// needs no synchronization.
 	lastEvictUsedMB int64
 
+	// prevReady and prevUsedMB are the ready-model set and usage sampled at
+	// the previous tick, used by observeAndLearn to attribute a usage delta
+	// to whatever models finished loading in between. prevOK is false until
+	// the first tick has run. Only touched by the single
+	// enforceBudgetPeriodically goroutine, so these need no synchronization
+	// (unlike swapper.learned, which observeAndLearn writes but EvictionFor
+	// reads from the run-loop goroutine).
+	prevReady  map[string]bool
+	prevUsedMB int64
+	prevOK     bool
+
 	warnEvictFreedNothing sync.Once
 	warnLastModelOver     sync.Once
 }
@@ -100,9 +111,53 @@ func (mb *MemoryBudget) enforceBudgetPeriodically(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			mb.observeAndLearn()
 			mb.enforceBudgetOnce()
 		}
 	}
+}
+
+// observeAndLearn updates each model's learned footprint (see the learned
+// field's doc comment on memoryBudgetSwapper) from what changed between this
+// tick and the last: a rise in usedMB, attributed evenly across whatever
+// models finished loading (transitioned to ready) since the previous tick.
+// Concurrent loads of models with no prior observation are still invisible
+// to reservedForInFlightMB — there is nothing to learn from before their
+// first load — but every load after that is covered, including concurrent
+// repeats of the exact burst that caught this blind spot the first time.
+func (mb *MemoryBudget) observeAndLearn() {
+	usedMB, ok := mb.swapper.usedMemoryMB()
+	if !ok {
+		return
+	}
+
+	states := mb.RunningModels()
+	ready := make(map[string]bool, len(states))
+	for id, st := range states {
+		if st == process.StateReady {
+			ready[id] = true
+		}
+	}
+
+	if mb.prevOK {
+		var newlyReady []string
+		for id := range ready {
+			if !mb.prevReady[id] {
+				newlyReady = append(newlyReady, id)
+			}
+		}
+		// A negative or zero delta means something was evicted in between
+		// too, or usage otherwise fell — not a usable signal for what the
+		// newly-ready models cost, so skip learning this tick rather than
+		// record a bogus (or negative) footprint.
+		if delta := usedMB - mb.prevUsedMB; len(newlyReady) > 0 && delta > 0 {
+			mb.swapper.recordLearned(newlyReady, delta/int64(len(newlyReady)))
+		}
+	}
+
+	mb.prevReady = ready
+	mb.prevUsedMB = usedMB
+	mb.prevOK = true
 }
 
 func (mb *MemoryBudget) enforceBudgetOnce() {
@@ -202,7 +257,49 @@ type memoryBudgetSwapper struct {
 	// hosts, where VRAM reads 0. Defaults to perfMon.SysMemUsedMB.
 	sampleSysMemUsedMB func() (int64, bool)
 
+	// learned is each model's most recently observed footprint in MB, filled
+	// in by observeAndLearn as models finish loading. EvictionFor uses it to
+	// reserve budget for models that are running-but-not-ready (still
+	// loading) so a burst of concurrent loads doesn't all sail through the
+	// "fits without eviction" check against a usedMB sample that predates
+	// every one of them finishing. A model with no entry yet (never observed
+	// loading before) contributes no reservation — see observeAndLearn.
+	learnedMu sync.RWMutex
+	learned   map[string]int64
+
 	warnUnified sync.Once
+}
+
+// recordLearned overwrites the learned footprint for each of ids with mb.
+func (s *memoryBudgetSwapper) recordLearned(ids []string, mb int64) {
+	s.learnedMu.Lock()
+	defer s.learnedMu.Unlock()
+	if s.learned == nil {
+		s.learned = make(map[string]int64, len(ids))
+	}
+	for _, id := range ids {
+		s.learned[id] = mb
+	}
+}
+
+// reservedForInFlightMB sums the learned footprint of every model in running
+// that is not yet StateReady — i.e. committed to load but not yet reflected
+// in a usedMB sample. Models with no learned entry (never observed loading
+// before) contribute 0: there is no basis for an estimate, so they are
+// silently invisible here, same as the blind spot this exists to shrink but
+// cannot fully close.
+func (s *memoryBudgetSwapper) reservedForInFlightMB(running []string) int64 {
+	s.learnedMu.RLock()
+	defer s.learnedMu.RUnlock()
+	var reserved int64
+	for _, id := range running {
+		p, ok := s.processes[id]
+		if !ok || p.State() == process.StateReady {
+			continue
+		}
+		reserved += s.learned[id]
+	}
+	return reserved
 }
 
 // usedMemoryMB samples memory used by the pool the budget applies to.
@@ -238,7 +335,11 @@ func (s *memoryBudgetSwapper) EvictionFor(target string, running []string) []str
 	}
 
 	usedMB, ok := s.usedMemoryMB()
-	if !ok || usedMB <= s.limitMB {
+	if !ok {
+		return nil
+	}
+	usedMB += s.reservedForInFlightMB(running)
+	if usedMB <= s.limitMB {
 		return nil
 	}
 
@@ -287,15 +388,16 @@ func (s *memoryBudgetSwapper) pickEvictions(candidates []string, usedMB int64, s
 func (s *memoryBudgetSwapper) OnSwapStart(target string, running []string) {
 	evict := s.EvictionFor(target, running)
 	usedMB, ok := s.usedMemoryMB()
+	reserved := s.reservedForInFlightMB(running)
 	switch {
 	case len(evict) > 0:
-		s.logger.Infof("memoryBudget: model=%s usedMB=%d limitMB=%d evict=%v", target, usedMB, s.limitMB, evict)
+		s.logger.Infof("memoryBudget: model=%s usedMB=%d reservedMB=%d limitMB=%d evict=%v", target, usedMB, reserved, s.limitMB, evict)
 	case len(running) == 0:
 		s.logger.Infof("memoryBudget: model=%s starting (no models running)", target)
 	case !ok:
 		s.logger.Debugf("memoryBudget: model=%s starting (no memory sample available yet)", target)
 	default:
-		s.logger.Debugf("memoryBudget: model=%s fits without eviction (usedMB=%d limitMB=%d)", target, usedMB, s.limitMB)
+		s.logger.Debugf("memoryBudget: model=%s fits without eviction (usedMB=%d reservedMB=%d limitMB=%d)", target, usedMB, reserved, s.limitMB)
 	}
 }
 
