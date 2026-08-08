@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -186,6 +187,174 @@ func newTestMemoryBudget(t *testing.T, conf config.Config, priority map[string]i
 		}
 	})
 	return r
+}
+
+// newTestMemoryBudgetWithUsage builds a MemoryBudget whose memory sample can be
+// changed between calls, for exercising enforceBudgetOnce across ticks.
+func newTestMemoryBudgetWithUsage(t *testing.T, conf config.Config, priority map[string]int, processes map[string]process.Process, usedMB *atomic.Int64) *MemoryBudget {
+	t.Helper()
+	r := newTestMemoryBudget(t, conf, priority, processes, 0)
+	r.swapper.sampleVRAMUsedMB = func() (int64, bool) { return usedMB.Load(), true }
+	return r
+}
+
+func TestMemoryBudget_EnforceBudgetOnceUnderBudget(t *testing.T) {
+	a := newFakeProcess("a")
+	a.testPid = 100
+	a.markReady()
+	b := newFakeProcess("b")
+	b.testPid = 101
+	b.markReady()
+
+	conf := config.Config{
+		HealthCheckTimeout: 5,
+		MemoryBudget:       &config.MemoryBudgetConfig{Limit: 1000},
+	}
+	var usedMB atomic.Int64
+	usedMB.Store(600)
+	r := newTestMemoryBudgetWithUsage(t, conf, map[string]int{"a": 1, "b": 10}, map[string]process.Process{"a": a, "b": b}, &usedMB)
+
+	r.enforceBudgetOnce()
+
+	if got := a.stopCalls.Load(); got != 0 {
+		t.Errorf("a.stopCalls=%d want 0 (under budget)", got)
+	}
+	if got := b.stopCalls.Load(); got != 0 {
+		t.Errorf("b.stopCalls=%d want 0 (under budget)", got)
+	}
+}
+
+func TestMemoryBudget_EnforceBudgetOnceEvictsLowestPriority(t *testing.T) {
+	a := newFakeProcess("a")
+	a.testPid = 100
+	a.markReady()
+	b := newFakeProcess("b")
+	b.testPid = 101
+	b.markReady()
+	c := newFakeProcess("c")
+	c.testPid = 102
+	c.markReady()
+
+	conf := config.Config{
+		HealthCheckTimeout: 5,
+		MemoryBudget:       &config.MemoryBudgetConfig{Limit: 1000},
+	}
+	// 1200MB used across 3 running models (400MB share each) over a 1000MB
+	// cap: evicting the lowest-priority model (a) alone is enough to fit.
+	var usedMB atomic.Int64
+	usedMB.Store(1200)
+	processes := map[string]process.Process{"a": a, "b": b, "c": c}
+	r := newTestMemoryBudgetWithUsage(t, conf, map[string]int{"a": 1, "b": 10, "c": 10}, processes, &usedMB)
+
+	r.enforceBudgetOnce()
+
+	if got := a.stopCalls.Load(); got != 1 {
+		t.Errorf("a.stopCalls=%d want 1 (lowest priority, over budget with no swap)", got)
+	}
+	if got := b.stopCalls.Load(); got != 0 {
+		t.Errorf("b.stopCalls=%d want 0", got)
+	}
+	if got := c.stopCalls.Load(); got != 0 {
+		t.Errorf("c.stopCalls=%d want 0", got)
+	}
+}
+
+func TestMemoryBudget_EnforceBudgetOnceSkipsStartingModels(t *testing.T) {
+	a := newFakeProcess("a")
+	a.testPid = 100
+	a.markReady()
+	b := newFakeProcess("b")
+	b.testPid = 101
+	b.setState(process.StateStarting)
+
+	conf := config.Config{
+		HealthCheckTimeout: 5,
+		MemoryBudget:       &config.MemoryBudgetConfig{Limit: 1000},
+	}
+	// b has the lower priority, so it would be evicted first if it were
+	// eligible — but it is still starting, leaving only a as a candidate.
+	var usedMB atomic.Int64
+	usedMB.Store(1200)
+	processes := map[string]process.Process{"a": a, "b": b}
+	r := newTestMemoryBudgetWithUsage(t, conf, map[string]int{"a": 1, "b": 0}, processes, &usedMB)
+
+	r.enforceBudgetOnce()
+
+	if got := a.stopCalls.Load(); got != 1 {
+		t.Errorf("a.stopCalls=%d want 1 (only ready candidate)", got)
+	}
+	if got := b.stopCalls.Load(); got != 0 {
+		t.Errorf("b.stopCalls=%d want 0 (still starting, not evictable)", got)
+	}
+}
+
+func TestMemoryBudget_EnforceBudgetOnceKeepsLastModel(t *testing.T) {
+	a := newFakeProcess("a")
+	a.testPid = 100
+	a.markReady()
+
+	conf := config.Config{
+		HealthCheckTimeout: 5,
+		MemoryBudget:       &config.MemoryBudgetConfig{Limit: 1000},
+	}
+	// One model whose own footprint blows the budget. Evicting it would empty
+	// the host, and the next request would just reload and re-evict it.
+	var usedMB atomic.Int64
+	usedMB.Store(5000)
+	r := newTestMemoryBudgetWithUsage(t, conf, map[string]int{"a": 1}, map[string]process.Process{"a": a}, &usedMB)
+
+	r.enforceBudgetOnce()
+	r.enforceBudgetOnce()
+
+	if got := a.stopCalls.Load(); got != 0 {
+		t.Errorf("a.stopCalls=%d want 0 (last running model is never evicted)", got)
+	}
+}
+
+func TestMemoryBudget_EnforceBudgetOnceStopsWhenEvictionFreesNothing(t *testing.T) {
+	a := newFakeProcess("a")
+	a.testPid = 100
+	a.markReady()
+	b := newFakeProcess("b")
+	b.testPid = 101
+	b.markReady()
+	c := newFakeProcess("c")
+	c.testPid = 102
+	c.markReady()
+
+	conf := config.Config{
+		HealthCheckTimeout: 5,
+		MemoryBudget:       &config.MemoryBudgetConfig{Limit: 1000},
+	}
+	// Usage never moves, as on a unified-memory host where the sample counts
+	// every process rather than only models.
+	var usedMB atomic.Int64
+	usedMB.Store(1200)
+	processes := map[string]process.Process{"a": a, "b": b, "c": c}
+	r := newTestMemoryBudgetWithUsage(t, conf, map[string]int{"a": 1, "b": 2, "c": 3}, processes, &usedMB)
+
+	r.enforceBudgetOnce()
+	if got := a.stopCalls.Load(); got != 1 {
+		t.Fatalf("a.stopCalls=%d want 1 on the first tick", got)
+	}
+
+	// Second tick: still over budget, but evicting a freed nothing, so no
+	// further model may be evicted.
+	r.enforceBudgetOnce()
+	if got := b.stopCalls.Load(); got != 0 {
+		t.Errorf("b.stopCalls=%d want 0 (previous eviction freed nothing)", got)
+	}
+
+	// Usage finally drops while staying over budget: eviction is trusted
+	// again.
+	usedMB.Store(1100)
+	r.enforceBudgetOnce()
+	if got := b.stopCalls.Load(); got != 1 {
+		t.Errorf("b.stopCalls=%d want 1 (usage dropped, eviction resumes)", got)
+	}
+	if got := c.stopCalls.Load(); got != 0 {
+		t.Errorf("c.stopCalls=%d want 0", got)
+	}
 }
 
 func TestMemoryBudget_SwapEvictsLowerPriority(t *testing.T) {
