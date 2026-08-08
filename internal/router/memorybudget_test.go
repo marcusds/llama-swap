@@ -178,7 +178,7 @@ func newTestMemoryBudget(t *testing.T, conf config.Config, priority map[string]i
 		t.Fatalf("newBaseRouter: %v", err)
 	}
 	base.testProcessed = make(chan struct{}, 64)
-	r := &MemoryBudget{baseRouter: base}
+	r := &MemoryBudget{baseRouter: base, swapper: swapper}
 	go base.run()
 	t.Cleanup(func() {
 		if !r.shuttingDown.Load() {
