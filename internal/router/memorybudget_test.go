@@ -743,3 +743,36 @@ func TestMemoryBudget_EnforceBudgetOnceResumesWhenNewLoadExplainsTheRise(t *test
 		t.Errorf("b.stopCalls=%d want 1 (c finishing loading explains the rise, so eviction resumes rather than pausing)", got)
 	}
 }
+
+// TestMemoryBudget_NextCheckIntervalTightensWhileLoading checks that the
+// periodic check switches to the tighter interval whenever any model is
+// mid-load, and relaxes back once nothing is.
+func TestMemoryBudget_NextCheckIntervalTightensWhileLoading(t *testing.T) {
+	a := newFakeProcess("a")
+	a.testPid = 100
+	a.markReady()
+
+	conf := config.Config{
+		HealthCheckTimeout: 5,
+		MemoryBudget:       &config.MemoryBudgetConfig{Limit: 1000},
+	}
+	r := newTestMemoryBudget(t, conf, map[string]int{"a": 1}, map[string]process.Process{"a": a}, 100)
+
+	if got := r.nextCheckInterval(); got != memoryBudgetCheckInterval {
+		t.Errorf("nextCheckInterval=%v want %v (nothing loading)", got, memoryBudgetCheckInterval)
+	}
+
+	b := newFakeProcess("b")
+	b.testPid = 101
+	b.setState(process.StateStarting)
+	r.processes["b"] = b
+
+	if got := r.nextCheckInterval(); got != memoryBudgetActiveLoadCheckInterval {
+		t.Errorf("nextCheckInterval=%v want %v (b is loading)", got, memoryBudgetActiveLoadCheckInterval)
+	}
+
+	b.markReady()
+	if got := r.nextCheckInterval(); got != memoryBudgetCheckInterval {
+		t.Errorf("nextCheckInterval=%v want %v (b finished loading)", got, memoryBudgetCheckInterval)
+	}
+}
