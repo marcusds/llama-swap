@@ -60,6 +60,7 @@ Built in Go for performance and simplicity, llama-swap has zero dependencies and
 - ✅ Customizable
   - Switch model ID routing at runtime with profiles
   - Run concurrent models with a custom DSL swap matrix ([#643](https://github.com/mostlygeek/llama-swap/issues/643))
+  - Run concurrent models under a VRAM cap with `memoryBudget` priority based eviction
   - Automatic unloading of models after timeout by setting a `ttl`
   - Docker and Podman support using `cmd` and `cmdStop` together
   - Preload models on startup with `hooks` ([#235](https://github.com/mostlygeek/llama-swap/pull/235))
@@ -215,6 +216,7 @@ Almost all configuration settings are optional and can be added one step at a ti
 
 - Advanced features
   - `matrix` to run concurrent models with a custom swap logic DSL
+  - `memoryBudget` to run concurrent models under a total VRAM cap, evicting the lowest priority model when room is needed
   - `hooks` to run things on startup
   - `macros` reusable snippets
 - Model customization
@@ -234,6 +236,23 @@ See the [configuration documentation](docs/configuration.md) for all options.
 When a request is made to an OpenAI compatible endpoint, llama-swap will extract the `model` value and load the appropriate server configuration to serve it. If the wrong upstream server is running, it will be replaced with the correct one. This is where the "swap" part comes in. The upstream server is automatically swapped to handle the request correctly.
 
 In the most basic configuration llama-swap handles one model at a time. For more advanced use cases, using a `matrix` allows multiple models to be loaded at the same time. You have complete control over how your system resources are used.
+
+Alternatively, `memoryBudget` manages concurrency for you. Instead of declaring valid model combinations, set a total memory `limit` and give each model a `priority`. llama-swap samples VRAM used from the host's GPU monitor and, when a new model needs room, evicts running models lowest priority first (ties broken by least recently used) until it fits. A config uses either `matrix` or `memoryBudget`, not both.
+
+Priorities can live in the `memoryBudget.models` block or directly on the model as a `priority:` field, whichever is easier to maintain:
+
+```yaml
+memoryBudget:
+  limit: 90GB
+
+models:
+  qwen3-vl-32b-thinking:
+    cmd: llama-server --port ${PORT} -m qwen3-vl-32b-thinking.gguf
+    priority: 10
+  qwen3-vl-8b-instruct:
+    cmd: llama-server --port ${PORT} -m qwen3-vl-8b-instruct.gguf
+    priority: 1
+```
 
 ## Reverse Proxy Configuration (nginx)
 
