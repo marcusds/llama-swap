@@ -187,13 +187,21 @@ func (mb *MemoryBudget) observeAndLearn() {
 		}
 	}
 
-	if mb.prevOK {
-		var newlyReady []string
-		for id := range ready {
-			if !mb.prevReady[id] {
-				newlyReady = append(newlyReady, id)
-			}
+	var newlyReady []string
+	for id := range ready {
+		if !mb.prevReady[id] {
+			newlyReady = append(newlyReady, id)
 		}
+	}
+	// Recorded unconditionally (even on the very first tick, and even when
+	// there's no usable delta to learn from below) — pickEvictions' grace
+	// period needs to know when a model became ready regardless of whether
+	// this tick can also attribute a footprint to it.
+	if len(newlyReady) > 0 {
+		mb.swapper.recordReadySince(newlyReady, time.Now())
+	}
+
+	if mb.prevOK {
 		// A negative or zero delta means something was evicted in between
 		// too, or usage otherwise fell — not a usable signal for what the
 		// newly-ready models cost, so skip learning this tick rather than
@@ -353,7 +361,54 @@ type memoryBudgetSwapper struct {
 	learnedMu sync.RWMutex
 	learned   map[string][]int64
 
+	// readySince is when each model last transitioned to StateReady, filled
+	// in by observeAndLearn. pickEvictions uses it to defer evicting a model
+	// still inside memoryBudgetEvictionGracePeriod of its own load: periodic
+	// eviction (unlike an admission-time swap, which the FIFO scheduler
+	// queues behind via conflictsWithInFlight rather than evicting into) does
+	// not check whether a model is currently serving a request before
+	// stopping it, so without this a model can be — and was, in practice —
+	// killed moments after loading, potentially mid-response to the very
+	// request that just loaded it. Priority alone doesn't protect against
+	// this: a model configured at a low priority is a prime eviction target
+	// the instant it becomes ready, if the host happens to be over budget at
+	// that moment, which a load that pushes usage up often causes directly.
+	readySinceMu sync.RWMutex
+	readySince   map[string]time.Time
+
 	warnUnified sync.Once
+}
+
+// memoryBudgetEvictionGracePeriod is how long a model is protected from
+// periodic eviction after becoming ready — see the readySince field's doc
+// comment. Chosen to comfortably outlast a typical inference response rather
+// than to match any particular check interval.
+const memoryBudgetEvictionGracePeriod = 30 * time.Second
+
+// recordReadySince sets readySince[id] = at for each of ids.
+func (s *memoryBudgetSwapper) recordReadySince(ids []string, at time.Time) {
+	s.readySinceMu.Lock()
+	defer s.readySinceMu.Unlock()
+	if s.readySince == nil {
+		s.readySince = make(map[string]time.Time, len(ids))
+	}
+	for _, id := range ids {
+		s.readySince[id] = at
+	}
+}
+
+// recentlyReady reports whether id became ready within the last
+// memoryBudgetEvictionGracePeriod. A model with no recorded readySince (for
+// example one that was already ready before this swapper started observing)
+// is not protected: there is no basis to believe it just loaded.
+func (s *memoryBudgetSwapper) recentlyReady(id string) bool {
+	s.readySinceMu.RLock()
+	defer s.readySinceMu.RUnlock()
+	t, ok := s.readySince[id]
+	if !ok {
+		return false
+	}
+	return time.Since(t) < memoryBudgetEvictionGracePeriod
 }
 
 // learnedHistoryLen is how many recent observations recordLearned keeps per
@@ -496,6 +551,15 @@ func (s *memoryBudgetSwapper) EvictionFor(target string, running []string) []str
 // set (e.g. periodic enforcement skipping still-starting processes) pass the
 // full running count so the assumed per-model share stays accurate.
 //
+// Candidates still inside their grace period (see the readySince field's doc
+// comment) are tried only after every other candidate, regardless of
+// priority: a model that just finished loading may still be serving the
+// request that loaded it, and periodic eviction has no way to tell — unlike
+// an admission-time swap, which the FIFO scheduler defers rather than
+// evicting into when the target is busy. Reaching into a protected candidate
+// anyway (when nothing else is left to evict) is preferred over never
+// reclaiming memory at all; it just goes last.
+//
 // VRAM isn't attributed per model (see the memoryBudgetSwapper doc comment),
 // so each eviction is assumed to free an equal share of the total currently
 // used. Only sampledMB is divided into shares: reservedMB stands for models
@@ -507,15 +571,15 @@ func (s *memoryBudgetSwapper) pickEvictions(candidates []string, sampledMB, rese
 		return nil
 	}
 
-	sorted := make([]string, len(candidates))
-	copy(sorted, candidates)
-	sort.Slice(sorted, func(i, j int) bool {
-		pi, pj := s.priority[sorted[i]], s.priority[sorted[j]]
-		if pi != pj {
-			return pi < pj
+	var unprotected, protected []string
+	for _, id := range candidates {
+		if s.recentlyReady(id) {
+			protected = append(protected, id)
+		} else {
+			unprotected = append(unprotected, id)
 		}
-		return s.lastUseOf(sorted[i]).Before(s.lastUseOf(sorted[j]))
-	})
+	}
+	sorted := append(s.sortByPriorityAndLRU(unprotected), s.sortByPriorityAndLRU(protected)...)
 
 	shareMB := sampledMB / int64(shareDivisor)
 
@@ -529,6 +593,21 @@ func (s *memoryBudgetSwapper) pickEvictions(candidates []string, sampledMB, rese
 		usedMB -= shareMB
 	}
 	return evict
+}
+
+// sortByPriorityAndLRU returns a copy of ids sorted by ascending priority
+// (lowest evicted first), ties broken by least-recently-used.
+func (s *memoryBudgetSwapper) sortByPriorityAndLRU(ids []string) []string {
+	sorted := make([]string, len(ids))
+	copy(sorted, ids)
+	sort.Slice(sorted, func(i, j int) bool {
+		pi, pj := s.priority[sorted[i]], s.priority[sorted[j]]
+		if pi != pj {
+			return pi < pj
+		}
+		return s.lastUseOf(sorted[i]).Before(s.lastUseOf(sorted[j]))
+	})
+	return sorted
 }
 
 func (s *memoryBudgetSwapper) OnSwapStart(target string, running []string) {
