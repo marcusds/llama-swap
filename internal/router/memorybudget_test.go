@@ -776,3 +776,75 @@ func TestMemoryBudget_NextCheckIntervalTightensWhileLoading(t *testing.T) {
 		t.Errorf("nextCheckInterval=%v want %v (b finished loading)", got, memoryBudgetCheckInterval)
 	}
 }
+
+// TestMemoryBudgetSwapper_GracePeriodProtectsJustLoadedModel reproduces the
+// reported bug directly: a low-priority model that just finished loading
+// must not be the first thing periodic eviction reaches for, even though
+// priority alone would normally put it first — it may still be serving the
+// very request that just loaded it, and periodic eviction (via
+// MemoryBudget.Unload) does not check in-flight requests before stopping a
+// process, unlike an admission-time swap.
+func TestMemoryBudgetSwapper_GracePeriodProtectsJustLoadedModel(t *testing.T) {
+	nomic := newFakeProcess("nomic")
+	nomic.testPid = 100
+	nomic.markReady()
+	dflash := newFakeProcess("dflash")
+	dflash.testPid = 101
+	dflash.markReady()
+	mtp := newFakeProcess("mtp")
+	mtp.testPid = 102
+	mtp.markReady() // just finished loading
+
+	processes := map[string]process.Process{"nomic": nomic, "dflash": dflash, "mtp": mtp}
+	// Mirrors the reported config: mtp is the lowest priority of the three,
+	// which would normally make it the first eviction target.
+	priority := map[string]int{"nomic": 10, "dflash": 10, "mtp": 1}
+	s := newTestMemoryBudgetSwapper(1000, priority, processes, 1500)
+	s.recordReadySince([]string{"mtp"}, time.Now()) // mtp just became ready
+
+	evict := s.pickEvictions([]string{"nomic", "dflash", "mtp"}, 1500, 0, 3)
+	if len(evict) == 0 || evict[0] == "mtp" {
+		t.Fatalf("evict=%v want mtp deferred to last despite its lower priority (it just loaded)", evict)
+	}
+}
+
+// TestMemoryBudgetSwapper_GracePeriodExpires checks the other half: once
+// memoryBudgetEvictionGracePeriod has actually elapsed, priority ordering
+// applies normally again.
+func TestMemoryBudgetSwapper_GracePeriodExpires(t *testing.T) {
+	a := newFakeProcess("a")
+	a.testPid = 100
+	a.markReady()
+	b := newFakeProcess("b")
+	b.testPid = 101
+	b.markReady()
+
+	processes := map[string]process.Process{"a": a, "b": b}
+	priority := map[string]int{"a": 10, "b": 1}
+	s := newTestMemoryBudgetSwapper(1000, priority, processes, 1500)
+	s.recordReadySince([]string{"b"}, time.Now().Add(-time.Hour)) // long past the grace period
+
+	evict := s.pickEvictions([]string{"a", "b"}, 1500, 0, 2)
+	if len(evict) == 0 || evict[0] != "b" {
+		t.Fatalf("evict=%v want b first (its grace period has long since expired, so priority applies normally)", evict)
+	}
+}
+
+// TestMemoryBudgetSwapper_GracePeriodStillEvictsIfNothingElseAvailable
+// checks the fallback: if every over-budget candidate is inside its grace
+// period, eviction still proceeds into them rather than never reclaiming
+// memory at all.
+func TestMemoryBudgetSwapper_GracePeriodStillEvictsIfNothingElseAvailable(t *testing.T) {
+	a := newFakeProcess("a")
+	a.testPid = 100
+	a.markReady()
+
+	processes := map[string]process.Process{"a": a}
+	s := newTestMemoryBudgetSwapper(1000, map[string]int{"a": 1}, processes, 1500)
+	s.recordReadySince([]string{"a"}, time.Now())
+
+	evict := s.pickEvictions([]string{"a"}, 1500, 0, 1)
+	if len(evict) != 1 || evict[0] != "a" {
+		t.Fatalf("evict=%v want [a] (only candidate, grace period must not block eviction entirely)", evict)
+	}
+}
