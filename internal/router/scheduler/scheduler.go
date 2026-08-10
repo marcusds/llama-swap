@@ -66,6 +66,14 @@ type Scheduler interface {
 	// swap waiters and queued requests). Process teardown is the baseRouter's
 	// responsibility.
 	OnShutdown(err error)
+	// InFlightCount returns how many requests modelID's process is currently
+	// serving. OnRequest already avoids evicting a busy model on its own
+	// (conflictsWithInFlight defers the swap by queuing instead), so normal
+	// admission-time eviction never needs this. It exists for eviction paths
+	// outside that decision tree — periodic memoryBudget enforcement being
+	// the only one today — which have no other way to tell a model is
+	// mid-response before stopping it.
+	InFlightCount(modelID string) int
 }
 
 // Effects is implemented by the baseRouter. The scheduler calls back through it
