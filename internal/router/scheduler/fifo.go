@@ -278,6 +278,11 @@ func (s *FIFO) OnShutdown(err error) {
 	}
 }
 
+// InFlightCount implements scheduler.Scheduler.
+func (s *FIFO) InFlightCount(modelID string) int {
+	return s.inFlight[modelID]
+}
+
 // grantHandler hands the caller a tracked handler for modelID and, only if the
 // caller was still there to receive it, bumps the in-flight count. Incrementing
 // when the grant failed would strand the counter and block future evictions.

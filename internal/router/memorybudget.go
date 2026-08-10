@@ -235,12 +235,27 @@ func (mb *MemoryBudget) enforceBudgetOnce() {
 	running := make([]string, 0, len(states))
 	ready := make([]string, 0, len(states))
 	readySet := make(map[string]bool, len(states))
+	busy := 0
 	for id, st := range states {
 		running = append(running, id)
-		if st == process.StateReady {
-			ready = append(ready, id)
-			readySet[id] = true
+		if st != process.StateReady {
+			continue
 		}
+		readySet[id] = true
+		// A busy model is never a periodic-eviction candidate, full stop —
+		// not "tried last" like the grace period below, but excluded
+		// entirely. Unlike an admission-time swap, which the scheduler
+		// queues behind rather than evicting into when the target is busy
+		// (conflictsWithInFlight), periodic eviction goes straight to
+		// Unload/StopProcesses with no such check of its own; without this,
+		// it can and did kill a model mid-response. readySet still counts it
+		// though — hasNewMember above cares whether something finished
+		// loading, not whether it happens to be busy right now.
+		if mb.InFlightCount(id) > 0 {
+			busy++
+			continue
+		}
+		ready = append(ready, id)
 	}
 
 	// An earlier tick evicted and usage has not dropped since — but that only
@@ -262,9 +277,10 @@ func (mb *MemoryBudget) enforceBudgetOnce() {
 	}
 
 	if len(ready) == 0 {
-		// Over budget with nothing evictable yet (e.g. the only running
-		// model is still starting) — nothing to do until the next tick.
-		mb.logger.Debugf("memoryBudget: periodic check usedMB=%d limitMB=%d over budget but no ready model to evict yet", usedMB, mb.swapper.limitMB)
+		// Over budget with nothing evictable yet — either the only running
+		// model is still starting, or every ready model is busy serving a
+		// request right now. Nothing to do until the next tick.
+		mb.logger.Debugf("memoryBudget: periodic check usedMB=%d limitMB=%d over budget but no eviction candidate available yet (busy=%d)", usedMB, mb.swapper.limitMB, busy)
 		return
 	}
 

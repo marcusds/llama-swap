@@ -848,3 +848,49 @@ func TestMemoryBudgetSwapper_GracePeriodStillEvictsIfNothingElseAvailable(t *tes
 		t.Fatalf("evict=%v want [a] (only candidate, grace period must not block eviction entirely)", evict)
 	}
 }
+
+// TestMemoryBudget_EnforceBudgetOnceNeverEvictsBusyModel reproduces the live
+// incident directly: a low-priority model handling an in-flight request must
+// survive periodic eviction even once its own load-time grace period has
+// long expired, because periodic eviction (via Unload/StopProcesses) has no
+// in-flight check of its own — unlike an admission-time swap, which the FIFO
+// scheduler queues behind instead of evicting into.
+func TestMemoryBudget_EnforceBudgetOnceNeverEvictsBusyModel(t *testing.T) {
+	a := newFakeProcess("a")
+	a.testPid = 100
+	a.autoReady = true
+	a.serveBlock = make(chan struct{})
+	b := newFakeProcess("b")
+	b.testPid = 101
+	b.markReady()
+
+	conf := config.Config{
+		HealthCheckTimeout: 5,
+		MemoryBudget:       &config.MemoryBudgetConfig{Limit: 1000},
+	}
+	// a is the lowest priority, normally the first eviction target.
+	r := newTestMemoryBudget(t, conf, map[string]int{"a": 1, "b": 10}, map[string]process.Process{"a": a, "b": b}, 1500)
+
+	// a's grace period from loading has long since expired: protection here
+	// must come from it being busy right now, not from having just loaded.
+	r.swapper.recordReadySince([]string{"a"}, time.Now().Add(-time.Hour))
+
+	done := make(chan struct{})
+	go func() {
+		r.ServeHTTP(httptest.NewRecorder(), newStreamRequest("a"))
+		close(done)
+	}()
+	waitSignal(t, a.serveStarted, "a request start")
+	waitProcessed(t, r.testProcessed, 1)
+
+	r.enforceBudgetOnce()
+	if got := a.stopCalls.Load(); got != 0 {
+		t.Errorf("a.stopCalls=%d want 0 (busy serving a request, must not be evicted)", got)
+	}
+	if got := b.stopCalls.Load(); got != 1 {
+		t.Errorf("b.stopCalls=%d want 1 (a is busy and excluded, so b is the only eligible candidate despite its higher priority)", got)
+	}
+
+	close(a.serveBlock)
+	waitSignal(t, done, "a request finish")
+}
