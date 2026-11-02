@@ -133,59 +133,6 @@ func tryLACT(ctx context.Context, every time.Duration, logger *logmon.Monitor) (
 	return ch, nil
 }
 
-func tryNvidiaSmi(ctx context.Context, every time.Duration, logger *logmon.Monitor) (chan []GpuStat, error) {
-	if _, err := exec.LookPath("nvidia-smi"); err != nil {
-		return nil, ErrNoGpuTool
-	}
-
-	sec := int(every.Seconds())
-	if sec < 1 {
-		sec = 1
-	}
-
-	cmd := exec.CommandContext(ctx, "nvidia-smi",
-		"--query-gpu=index,name,uuid,temperature.gpu,utilization.gpu,memory.used,memory.total,fan.speed,power.draw",
-		"--format=csv,noheader,nounits",
-		"--loop", fmt.Sprintf("%d", sec),
-	)
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, fmt.Errorf("nvidia-smi stdout pipe failed: %w", err)
-	}
-
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("nvidia-smi start failed: %w", err)
-	}
-
-	ch := make(chan []GpuStat, 1)
-
-	go func() {
-		defer close(ch)
-
-		scanner := bufio.NewScanner(stdout)
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" {
-				continue
-			}
-
-			stat := ParseNvidiaSmiLine(line)
-			if stat != nil {
-				select {
-				case ch <- []GpuStat{*stat}:
-				default:
-				}
-			}
-		}
-		if err := cmd.Wait(); err != nil && ctx.Err() == nil {
-			logger.Errorf("nvidia-smi exited: %s", err.Error())
-		}
-	}()
-
-	return ch, nil
-}
-
 func tryRocmSmi(ctx context.Context, every time.Duration, logger *logmon.Monitor) (chan []GpuStat, error) {
 	if _, err := exec.LookPath("rocm-smi"); err != nil {
 		return nil, ErrNoGpuTool

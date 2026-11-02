@@ -528,6 +528,27 @@ func TestParseNvidiaSmiLine_ValidLine(t *testing.T) {
 	assert.InDelta(t, 80.0, stat.MemUtilPct, 0.01)
 }
 
+// TestParseNvidiaSmiOutput_MultiGPU checks that one poll yields one snapshot
+// holding every GPU, so VRAMUsedMB sums all cards instead of the last line.
+func TestParseNvidiaSmiOutput_MultiGPU(t *testing.T) {
+	out := "0, NVIDIA GeForce RTX 3090, GPU-a, 60, 50, 8000, 24576, 40, 200\n" +
+		"\n" +
+		"1, NVIDIA GeForce RTX 3090, GPU-b, 62, 70, 12000, 24576, 45, 250\n" +
+		"garbage\n"
+
+	stats := ParseNvidiaSmiOutput(out)
+	require.Len(t, stats, 2)
+	assert.Equal(t, 0, stats[0].ID)
+	assert.Equal(t, 1, stats[1].ID)
+
+	m, err := New(config.PerformanceConfig{Every: time.Second}, newTestLogger())
+	require.NoError(t, err)
+	m.gpuRing.Push(stats)
+	used, _, ok := m.VRAMUsedMB()
+	require.True(t, ok)
+	assert.Equal(t, int64(20000), used)
+}
+
 func TestParseNvidiaSmiLine_ShortLine(t *testing.T) {
 	line := "0, NVIDIA GPU, GPU-123"
 
