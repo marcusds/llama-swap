@@ -118,6 +118,36 @@
             },
             "description": "A dictionary of group settings. Provides advanced controls over model swapping behaviour. Model IDs must be defined in models. A model can only be a member of one group. Behaviour controlled via swap, exclusive, persistent."
         },
+        "budgetConfig": {
+            "type": "object",
+            "description": "Priority-based router, selected with routing.router.use: budget. Tracks a total VRAM cap and evicts lowest-priority running models when starting a new model would exceed limitMB. Total VRAM used is measured live from the host's GPU monitor (nvidia-smi, rocm-smi, LACT, ...); requires performance monitoring to be enabled.",
+            "required": [
+                "limitMB"
+            ],
+            "properties": {
+                "limitMB": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Total VRAM cap across all GPUs, in megabytes."
+                },
+                "models": {
+                    "type": "object",
+                    "description": "Per-model eviction priority. Keys must be model IDs defined in models. Models not listed default to priority: 0, unless the model sets its own top-level priority field. Entries here take precedence over a model's own priority field.",
+                    "additionalProperties": {
+                        "type": "object",
+                        "properties": {
+                            "priority": {
+                                "type": "integer",
+                                "default": 0,
+                                "description": "Higher priority models are evicted last. Ties broken by least-recently-used."
+                            }
+                        },
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "additionalProperties": false
+        },
         "matrixConfig": {
             "type": "object",
             "description": "Solver-based alternative to groups. Declares valid combinations of concurrent models. The solver minimizes eviction cost when swapping. A config must use either groups or matrix, not both.",
@@ -594,6 +624,11 @@
                         "default": false,
                         "description": "If true the model will not show up in /v1/models responses. It can still be used as normal in API requests."
                     },
+                    "priority": {
+                        "type": "integer",
+                        "default": 0,
+                        "description": "budget eviction priority. Higher priority models are evicted last, ties broken by least-recently-used. Only used when the budget router is active. An entry for this model under budget.models takes precedence."
+                    },
                     "timeouts": {
                         "$ref": "#/definitions/timeouts"
                     },
@@ -1026,10 +1061,11 @@
                             "enum": [
                                 "group",
                                 "matrix",
-                                "capacity"
+                                "capacity",
+                                "budget"
                             ],
                             "default": "group",
-                            "description": "Router to use. 'group' uses static groups, 'matrix' uses allowed combinations, 'capacity' uses declared resource pools."
+                            "description": "Router to use. 'group' uses static groups, 'matrix' uses allowed combinations, 'capacity' uses declared resource pools, 'budget' uses priority-based eviction under a total memory cap."
                         },
                         "settings": {
                             "type": "object",
@@ -1057,6 +1093,9 @@
                                         }
                                     },
                                     "additionalProperties": false
+                                },
+                                "budget": {
+                                    "$ref": "#/definitions/budgetConfig"
                                 }
                             },
                             "additionalProperties": false

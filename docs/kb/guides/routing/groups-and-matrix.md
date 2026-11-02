@@ -1,21 +1,21 @@
 ---
-title: Running several models at once with groups, matrix and capacity
-summary: Choosing between group, matrix and capacity routers, and how each decides what gets unloaded.
+title: Running several models at once with groups, matrix, capacity and budget
+summary: Choosing between group, matrix, capacity and budget routers, and how each decides what gets unloaded.
 category: guides
-tags: [routing, groups, matrix, capacity, concurrency, swap, vram, memory]
-config_keys: [routing, routing.router.use, routing.router.settings.groups, routing.router.settings.matrix, routing.router.settings.capacity.pools, models.*.capacities, models.*.evict_cost]
-updated: 2026-10-22
+tags: [routing, groups, matrix, capacity, budget, priority, concurrency, swap, vram, memory]
+config_keys: [routing, routing.router.use, routing.router.settings.groups, routing.router.settings.matrix, routing.router.settings.capacity.pools, routing.router.settings.budget.limitMB, routing.router.settings.budget.models, models.*.capacities, models.*.evict_cost, models.*.priority]
+updated: 2026-11-02
 ---
 
-# Running several models at once: groups, matrix and capacity
+# Running several models at once: groups, matrix, capacity and budget
 
 Out of the box llama-swap runs one model at a time. The `routing` section
-changes that. There are three engines and you pick one:
+changes that. There are four engines and you pick one:
 
 ```yaml
 routing:
   router:
-    use: group     # or: matrix, capacity
+    use: group     # or: matrix, capacity, budget
 ```
 
 ## `group` — the default, simpler
@@ -285,3 +285,33 @@ Higher numbers are serviced first. Models default to 0.
 - `guides/model-runtime/ttl-and-unloading` — reclaiming VRAM from idle models
 - `guides/tools/kubeswap` — the kubeswap Helm chart, whose
   `config.matrix` builds this section from the model roster
+
+## `budget` — measured memory cap, priority eviction
+
+Set a total memory cap and give models a priority. Unlike `capacity`, usage is
+measured live from the host's GPU monitor (VRAM used across all GPUs, falling
+back to system memory on unified-memory hosts), so it needs performance
+monitoring enabled. When a request would push usage over `limitMB`, running
+models are evicted lowest priority first (ties: least recently used) until it
+fits. A model that is serving a request is never evicted by the periodic check.
+
+```yaml
+routing:
+  router:
+    use: budget
+    settings:
+      budget:
+        limitMB: 24576   # 24GB
+        models:
+          gemma: {priority: 10}   # evicted last
+          qwen: {priority: 1}
+models:
+  mistral:
+    cmd: llama-server -m /models/mistral.gguf --port ${PORT}
+    priority: 5   # same as a budget.models entry; the budget entry wins
+```
+
+`limitMB` is a soft cap: the requested model still runs if it is over after
+everything else is evicted. Models with no priority default to 0. Usage counts
+everything on the GPU (or all system memory), not only llama-swap models, so
+leave headroom.

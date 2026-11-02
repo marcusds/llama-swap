@@ -639,6 +639,17 @@ models:
     unlisted: true
     cmd: some-upstream-server
 
+  # budget priority example:
+  "priority-model":
+    # priority: eviction priority for the budget router
+    # - optional, default: 0
+    # - only used when the budget router is active
+    # - higher priority models are evicted last, ties broken by
+    #   least-recently-used
+    # - an entry for this model under budget.models wins over this field
+    priority: 10
+    cmd: llama-server --port ${PORT} -m Llama-3.2-1B-Instruct-Q4_K_M.gguf
+
   # Docker example:
   # container runtimes like Docker and Podman can be used reliably with
   # a combination of cmd, cmdStop, and ${MODEL_ID}
@@ -703,7 +714,7 @@ routing:
   router:
     # use: a string defining which engine to use
     # - optional, default: "group"
-    # - valid values: group, matrix, capacity
+    # - valid values: group, matrix, capacity, budget
     use: group
 
     # settings: a dictionary of settings for the specific engines
@@ -860,6 +871,64 @@ routing:
           # The 70B model uses every GPU, so it can only run alone.
           # Vars are not required when using real model IDs.
           full: "llama-70B"
+
+      # budget: priority-based eviction under a total memory cap.
+      # An alternative to groups/matrix — select it with `use: budget`
+      # above instead of "group".
+      #
+      # Instead of declaring valid combinations of models, budget keeps
+      # total VRAM used under limitMB. Models are given a priority: important,
+      # frequently used, low-latency models get a high priority so they stay
+      # loaded; lower priority models are evicted first when room is needed.
+      #
+      # VRAM usage is measured live from the host's GPU monitor (nvidia-smi,
+      # rocm-smi, LACT, ...) — the same multi-vendor sampling used for the
+      # Performance dashboard — so this router requires performance
+      # monitoring to be enabled (`performance.disabled: false`, the
+      # default). It is total VRAM used across all GPUs, not per-model: GPU
+      # tools don't expose a reliable per-process breakdown across vendors,
+      # so each evicted model is assumed to free an equal share of the total.
+      #
+      # Hosts with unified CPU/GPU memory (NVIDIA Grace-Blackwell GB10, for
+      # example) have no separate framebuffer, so nvidia-smi reports 0MB used
+      # even while models are resident. There the pool being budgeted is
+      # system RAM, so a 0MB VRAM reading falls back to system memory used
+      # (the same figure `free` reports as used) and logs a warning once. Set
+      # limitMB against total system memory on those hosts, and leave headroom:
+      # system memory used counts everything, not only models.
+      #
+      # Solver behaviour (runs when a model is requested):
+      #   1. If the requested model is already running, forward immediately. Done.
+      #   2. If current total VRAM used fits under limitMB, no eviction needed.
+      #      Start it. Forward request.
+      #   3. Otherwise, evict running models lowest-priority-first (ties broken
+      #      by least-recently-used) until the estimate fits. Because the
+      #      requested model must load now, eviction proceeds through
+      #      higher-priority models too if that's what it takes to fit.
+      #   4. Start the requested model. Forward request.
+      #
+      # limitMB is a soft cap: if VRAM is still over limitMB after evicting every
+      # other model, the requested model still runs.
+      #
+      # limitMB is the total memory cap in megabytes.
+      #
+      # Priorities can be set two ways, and both can be mixed in one config:
+      #   1. In the budget.models block below.
+      #   2. As a `priority:` field on the model itself, in the models
+      #      section. Handy when priorities are easier to maintain next to
+      #      the model they belong to.
+      # If a model appears in both places the budget.models entry wins.
+      # Models with no priority anywhere default to 0.
+      budget:
+        limitMB: 24576 # 24GB
+
+        models:
+          gemma-model:
+            priority: 10 # kept loaded, evicted last
+          qwen-model:
+            priority: 5
+          mistral-model:
+            priority: 1 # evicted first when room is needed
 
   # scheduler: how queued requests are ordered.
   # The default and only valid scheduler is "fifo"

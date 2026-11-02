@@ -25,6 +25,17 @@ func (r *Buffer[T]) Push(v T) {
 	}
 }
 
+// Last returns the most recently pushed entry and true, or the zero value
+// and false if the buffer is empty.
+func (r *Buffer[T]) Last() (T, bool) {
+	var zero T
+	if r.size == 0 {
+		return zero, false
+	}
+	cap := len(r.buf)
+	return r.buf[(r.head+r.size-1)%cap], true
+}
+
 // Slice returns all entries in insertion order as a new slice.
 func (r *Buffer[T]) Slice() []T {
 	if r.size == 0 {

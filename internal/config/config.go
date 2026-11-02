@@ -323,7 +323,7 @@ type FifoConfig struct {
 }
 
 type RouterConfig struct {
-	Use      string         `yaml:"use"` // "group" (default) | "matrix" | "capacity"
+	Use      string         `yaml:"use"` // "group" (default) | "matrix" | "capacity" | "budget"
 	Settings RouterSettings `yaml:"settings"`
 }
 
@@ -331,6 +331,7 @@ type RouterSettings struct {
 	Groups   map[string]GroupConfig `yaml:"groups"`
 	Matrix   *MatrixConfig          `yaml:"matrix"`
 	Capacity *CapacityConfig        `yaml:"capacity"`
+	Budget   *BudgetConfig          `yaml:"budget"`
 }
 
 func (c *Config) RealModelName(search string) (string, bool) {

@@ -48,15 +48,8 @@ func NewMatrix(conf config.Config, logs *logmon.Group) (*Matrix, error) {
 		return nil, fmt.Errorf("creating base router: %w", err)
 	}
 
-	for mid, modelCfg := range conf.Models {
-		procLog := logmon.NewWriter(logs.UpstreamLogs)
-		p, err := process.New(base.procCtx, mid, modelCfg, procLog, logs.ProxyLogs)
-		if err != nil {
-			base.shutdownFn()
-			base.procCancel()
-			return nil, fmt.Errorf("creating process for %q: %w", mid, err)
-		}
-		processes[mid] = p
+	if err := base.addProcesses(conf, logs); err != nil {
+		return nil, err
 	}
 
 	r := &Matrix{baseRouter: base}

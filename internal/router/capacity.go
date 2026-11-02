@@ -26,14 +26,8 @@ func NewCapacity(conf config.Config, logs *logmon.Group) (*Capacity, error) {
 	if err != nil {
 		return nil, fmt.Errorf("creating base router: %w", err)
 	}
-	for id, model := range conf.Models {
-		p, err := process.New(base.procCtx, id, model, logmon.NewWriter(logs.UpstreamLogs), logs.ProxyLogs)
-		if err != nil {
-			base.shutdownFn()
-			base.procCancel()
-			return nil, fmt.Errorf("creating process for %q: %w", id, err)
-		}
-		processes[id] = p
+	if err := base.addProcesses(conf, logs); err != nil {
+		return nil, err
 	}
 	go base.run()
 	return &Capacity{baseRouter: base}, nil

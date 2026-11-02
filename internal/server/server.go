@@ -267,6 +267,11 @@ func New(cfg config.Config, logs *logmon.Group, perfMon *perf.Monitor, st store.
 		if err != nil {
 			return nil, fmt.Errorf("creating matrix router: %w", err)
 		}
+	case "budget":
+		local, err = router.NewBudget(cfg, logs, perfMon)
+		if err != nil {
+			return nil, fmt.Errorf("creating budget router: %w", err)
+		}
 	default: // "group"
 		local, err = router.NewGroup(cfg, logs)
 		if err != nil {

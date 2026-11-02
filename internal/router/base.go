@@ -28,6 +28,11 @@ type unloadReq struct {
 	respond chan struct{}
 }
 
+type inFlightQuery struct {
+	modelID string
+	respond chan int
+}
+
 // baseRouter owns the channels, run-loop, and process machinery shared by every
 // concrete router. Concrete routers embed *baseRouter and supply a
 // scheduler.Swapper describing how eviction sets are decided. baseRouter
@@ -60,6 +65,7 @@ type baseRouter struct {
 	unloadCh    chan unloadReq
 	swapDoneCh  chan scheduler.SwapDone
 	serveDoneCh chan scheduler.ServeDoneEvent
+	inFlightCh  chan inFlightQuery
 
 	runDone chan struct{}
 
@@ -100,6 +106,7 @@ func newBaseRouter(
 		unloadCh:    make(chan unloadReq),
 		swapDoneCh:  make(chan scheduler.SwapDone),
 		serveDoneCh: make(chan scheduler.ServeDoneEvent),
+		inFlightCh:  make(chan inFlightQuery),
 		runDone:     make(chan struct{}),
 	}
 	sched, err := scheduler.New(conf, name, logger, planner, b)
@@ -144,6 +151,9 @@ func (b *baseRouter) run() {
 
 		case ev := <-b.serveDoneCh:
 			b.schedule.OnServeDone(ev)
+
+		case q := <-b.inFlightCh:
+			q.respond <- b.schedule.InFlightCount(q.modelID)
 		}
 	}
 }
@@ -500,6 +510,42 @@ func (b *baseRouter) sendUnload(targets []string, timeout time.Duration) {
 		return
 	}
 	<-req.respond
+}
+
+// addProcesses creates a process for every model in conf and registers it in
+// b.processes. On failure it cancels the router's contexts, so the caller can
+// just return the error.
+func (b *baseRouter) addProcesses(conf config.Config, logs *logmon.Group) error {
+	for mid, modelCfg := range conf.Models {
+		p, err := process.New(b.procCtx, mid, modelCfg, logmon.NewWriter(logs.UpstreamLogs), logs.ProxyLogs)
+		if err != nil {
+			b.shutdownFn()
+			b.procCancel()
+			return fmt.Errorf("creating process for %q: %w", mid, err)
+		}
+		b.processes[mid] = p
+	}
+	return nil
+}
+
+// InFlightCount returns how many requests modelID's process is currently
+// serving, by funneling the query through the run loop so it's answered from
+// the same goroutine that owns the scheduler's state — this is safe to call
+// from any goroutine, including a periodic ticker outside the request path
+// (see scheduler.Scheduler.InFlightCount's doc comment for why it exists).
+func (b *baseRouter) InFlightCount(modelID string) int {
+	q := inFlightQuery{modelID: modelID, respond: make(chan int, 1)}
+	select {
+	case b.inFlightCh <- q:
+	case <-b.runDone:
+		return 0
+	}
+	select {
+	case n := <-q.respond:
+		return n
+	case <-b.runDone:
+		return 0
+	}
 }
 
 func (b *baseRouter) Shutdown(timeout time.Duration) error {
