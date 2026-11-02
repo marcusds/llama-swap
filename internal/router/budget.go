@@ -91,9 +91,15 @@ func NewBudget(conf config.Config, logs *logmon.Group, perfMon *perf.Monitor) (*
 		logger:             proxylog,
 		sampleVRAMUsedMB:   perfMon.VRAMUsedMB,
 		sampleSysMemUsedMB: perfMon.SysMemUsedMB,
+		sampleProcVRAMMB:   perfMon.ProcessVRAMMB,
+		descendants:        process.Descendants,
+		declared:           make(map[string]int64),
 	}
 	for modelID, entry := range mb.Models {
-		swapper.priority[modelID] = entry.Priority
+		swapper.priority[modelID] = entry.PriorityOrZero()
+		if entry.SizeMB > 0 {
+			swapper.declared[modelID] = entry.SizeMB
+		}
 	}
 
 	base, err := newBaseRouter("budget", conf, processes, proxylog, swapper)
@@ -154,7 +160,9 @@ func (mb *Budget) nextCheckInterval() time.Duration {
 // observeAndLearn updates learned footprints (see budgetSwapper.learned) and
 // readySince.
 //
-// A footprint is the rise in usage from the baseline (a sample taken while
+// Where per-process VRAM is available (see measureProcesses), a ready model's
+// footprint is read directly. Otherwise a footprint is the rise in usage from
+// the baseline (a sample taken while
 // the model was not yet running) to the first sample taken after it became
 // ready. The weights land in memory while the model is still starting, so
 // the baseline must predate the load, not just the previous tick. When
@@ -208,6 +216,10 @@ func (mb *Budget) observeAndLearn() {
 	mb.prevRunning = running
 	mb.prevReady = ready
 
+	// Per-process figures, where available, are clean per-model data and need
+	// no quiet window.
+	perProc := mb.swapper.measureProcesses(ready)
+
 	if !quiet || smp.src == sourceNone || smp.at.Before(mb.lastChangeAt) {
 		return
 	}
@@ -230,8 +242,19 @@ func (mb *Budget) observeAndLearn() {
 				removed = true
 			}
 		}
-		if delta := smp.mb - baseMB; len(added) > 0 && !removed && delta > 0 {
-			mb.swapper.recordLearned(added, delta/int64(len(added)))
+		// Models measured per process already have a clean figure; take
+		// their share out of the rise and split the rest among the others.
+		delta := smp.mb - baseMB
+		var unmeasured []string
+		for _, id := range added {
+			if v, ok := perProc[id]; ok {
+				delta -= v
+			} else {
+				unmeasured = append(unmeasured, id)
+			}
+		}
+		if len(unmeasured) > 0 && !removed && delta > 0 {
+			mb.swapper.recordLearned(unmeasured, delta/int64(len(unmeasured)))
 		}
 	}
 	mb.baseline = &budgetSnapshot{sample: smp, ready: ready}
@@ -305,12 +328,16 @@ func (mb *Budget) enforceBudgetOnce() {
 		return
 	}
 	maxEvict := len(states) - 1
+	pool := make([]string, 0, len(states))
+	for id := range states {
+		pool = append(pool, id)
+	}
 
 	// The idle check and the stop are one step on the run loop, so a model
 	// cannot be granted a request between them. The usage sample is a plain
 	// measurement here, so nothing is reserved for loading models.
 	evicted, done := mb.EvictIdle(ready, func(idle []string) []string {
-		evict := mb.swapper.pickEvictions(idle, smp.mb, 0, len(states))
+		evict := mb.swapper.pickEvictions(idle, pool, smp.mb, 0)
 		if len(evict) > maxEvict {
 			evict = evict[:maxEvict]
 		}
@@ -348,9 +375,11 @@ func hasNewMember(current, previous map[string]bool) bool {
 // On hosts with unified CPU/GPU memory, where GPU tools report 0MB VRAM used,
 // the budget is applied to system memory used instead (see usedMemoryMB).
 //
-// GPU monitoring tools (nvidia-smi, rocm-smi, LACT, ...) report total VRAM
-// used, not a per-model breakdown, so eviction treats the current total as a
-// shared pool: each evicted model is assumed to free an equal share of it.
+// Admission and eviction use a per-model size estimate (see estimateMB): a
+// declared sizeMB, a per-process VRAM measurement, or a learned median. The
+// measured total is the safety net: it is what must stay under the limit, and
+// models with no estimate are assumed to free an equal share of whatever the
+// known estimates do not account for.
 type budgetSwapper struct {
 	limitMB   int64
 	priority  map[string]int // model ID -> priority, default 0
@@ -367,19 +396,40 @@ type budgetSwapper struct {
 	// signal on unified-memory hosts. Defaults to perfMon.SysMemUsedMB.
 	sampleSysMemUsedMB func() (int64, time.Time, bool)
 
+	// sampleProcVRAMMB returns per-process VRAM use (PID -> MB) and when it
+	// was sampled, and false when unavailable. Defaults to
+	// perfMon.ProcessVRAMMB (NVIDIA only); nil disables per-process data.
+	sampleProcVRAMMB func() (map[int]int64, time.Time, bool)
+
+	// descendants returns a PID and all its descendants, so a model launched
+	// through a wrapper is matched to the child doing the GPU work. Defaults
+	// to process.Descendants.
+	descendants func(pid int) map[int]bool
+
+	// declared is each model's configured sizeMB (budget.models.<id>.sizeMB).
+	// Read-only after construction.
+	declared map[string]int64
+
+	// measured is each model's latest per-process VRAM figure, kept after
+	// the model stops so it still estimates the next load. procLearnedAt is
+	// the readySince of the load last recorded into learned from per-process
+	// data, so each load is recorded once.
+	measuredMu    sync.RWMutex
+	measured      map[string]int64
+	procLearnedAt map[string]time.Time
+
 	// memMode is the memoryMode usedMemoryMB has settled on.
 	memMode atomic.Int32
 
 	// learned holds each model's recent observed footprints in MB (most
-	// recent last, capped at learnedHistoryLen), filled in by observeAndLearn.
-	// EvictionFor reserves the median of a model's history for models that
-	// are still loading (see reservedForInFlightMB), so a burst of concurrent
-	// loads is not admitted against a sample that predates all of them.
+	// recent last, capped at learnedHistoryLen), filled in by observeAndLearn
+	// from per-process figures or, without those, usage deltas. Its median is
+	// the last-resort estimate (see estimateMB).
 	//
-	// The median is used because a single observation can be noise: on the
+	// The median is used because a delta observation can be noise: on the
 	// system-memory fallback any unrelated allocation during a load is
 	// attributed to that model. A model with fewer than minLearnedSamples
-	// observations reserves nothing.
+	// observations has no learned estimate.
 	learnedMu sync.RWMutex
 	learned   map[string][]int64
 
@@ -402,6 +452,7 @@ type budgetDecision struct {
 	target   string
 	sample   memSample
 	reserved int64
+	targetMB int64 // the target's estimate, 0 when unknown
 }
 
 // budgetEvictionGracePeriod is how long a model is tried last for periodic
@@ -475,7 +526,7 @@ func (s *budgetSwapper) learnedFootprintLocked(id string) int64 {
 	return (sorted[n/2-1] + sorted[n/2]) / 2
 }
 
-// reservedForInFlightMB sums the learned footprint of every model in running
+// reservedForInFlightMB sums the estimate (see estimateMB) of every model in running
 // that is committed to load but not yet reflected in a usage sample:
 // StateStarting, or StateStopped for a swap target the scheduler has
 // committed to but not started yet.
@@ -484,8 +535,6 @@ func (s *budgetSwapper) learnedFootprintLocked(id string) int64 {
 // their memory is about to be freed, so reserving for them would count them
 // twice and evict more than needed.
 func (s *budgetSwapper) reservedForInFlightMB(running []string) int64 {
-	s.learnedMu.RLock()
-	defer s.learnedMu.RUnlock()
 	var reserved int64
 	for _, id := range running {
 		p, ok := s.processes[id]
@@ -495,9 +544,95 @@ func (s *budgetSwapper) reservedForInFlightMB(running []string) int64 {
 		if st := p.State(); st == process.StateReady || st == process.StateStopping {
 			continue
 		}
-		reserved += s.learnedFootprintLocked(id)
+		if est, ok := s.estimateMB(id); ok {
+			reserved += est
+		}
 	}
 	return reserved
+}
+
+// estimateMB returns id's expected footprint once loaded: its declared
+// sizeMB, else its latest per-process VRAM measurement, else the median of
+// its learned history. ok is false when none is available.
+func (s *budgetSwapper) estimateMB(id string) (int64, bool) {
+	if v := s.declared[id]; v > 0 {
+		return v, true
+	}
+	s.measuredMu.RLock()
+	v, ok := s.measured[id]
+	s.measuredMu.RUnlock()
+	if ok && v > 0 {
+		return v, true
+	}
+	s.learnedMu.RLock()
+	v = s.learnedFootprintLocked(id)
+	s.learnedMu.RUnlock()
+	return v, v > 0
+}
+
+// measureProcesses reads per-process VRAM for each ready model, summed over
+// the model's process tree, and updates measured. A figure counts only when
+// the sample was taken after the model became ready. Each load's first such
+// figure is also recorded into learned, as clean data. It returns the figures
+// found this call, keyed by model ID; nil when per-process data is
+// unavailable.
+func (s *budgetSwapper) measureProcesses(ready map[string]bool) map[string]int64 {
+	if s.sampleProcVRAMMB == nil || s.descendants == nil || len(ready) == 0 {
+		return nil
+	}
+	usage, at, ok := s.sampleProcVRAMMB()
+	if !ok || len(usage) == 0 {
+		return nil
+	}
+	out := make(map[string]int64, len(ready))
+	since := make(map[string]time.Time, len(ready))
+	for id := range ready {
+		p, ok := s.processes[id]
+		if !ok {
+			continue
+		}
+		pid, ok := p.Pid()
+		if !ok {
+			continue
+		}
+		var sum int64
+		for d := range s.descendants(pid) {
+			sum += usage[d]
+		}
+		if sum <= 0 {
+			continue
+		}
+		s.readySinceMu.RLock()
+		rs := s.readySince[id]
+		s.readySinceMu.RUnlock()
+		if at.Before(rs) {
+			continue // sampled before this load finished
+		}
+		out[id] = sum
+		since[id] = rs
+	}
+	if len(out) == 0 {
+		return nil
+	}
+
+	var toLearn []string
+	s.measuredMu.Lock()
+	if s.measured == nil {
+		s.measured = make(map[string]int64, len(out))
+		s.procLearnedAt = make(map[string]time.Time, len(out))
+	}
+	for id, v := range out {
+		s.measured[id] = v
+		if last, seen := s.procLearnedAt[id]; !seen || !last.Equal(since[id]) {
+			s.procLearnedAt[id] = since[id]
+			toLearn = append(toLearn, id)
+		}
+	}
+	s.measuredMu.Unlock()
+	for _, id := range toLearn {
+		s.recordLearned([]string{id}, out[id])
+	}
+	return out
 }
 
 // memorySource identifies which pool a usedMemoryMB sample was read from.
@@ -625,30 +760,33 @@ func (s *budgetSwapper) EvictionFor(target string, running []string) []string {
 		return nil
 	}
 	reservedMB := s.reservedForInFlightMB(running)
-	s.lastDecision = budgetDecision{target: target, sample: smp, reserved: reservedMB}
-	if smp.mb+reservedMB <= s.limitMB {
+	// With a known estimate for the target, admission makes room for it
+	// before it loads; without one, only the current usage is checked.
+	targetMB, _ := s.estimateMB(target)
+	s.lastDecision = budgetDecision{target: target, sample: smp, reserved: reservedMB, targetMB: targetMB}
+	if smp.mb+reservedMB+targetMB <= s.limitMB {
 		return nil
 	}
 
-	return s.pickEvictions(running, smp.mb, reservedMB, len(running))
+	return s.pickEvictions(running, running, smp.mb, reservedMB+targetMB)
 }
 
 // pickEvictions greedily selects the lowest-priority (ties broken by
-// least-recently-used) models from candidates until sampledMB+reservedMB,
-// decremented by an equal share per eviction, would drop to or below the
-// limit. shareDivisor is the size of the pool the share is computed against:
-// usually len(candidates), but callers evicting from a subset of the running
-// set pass the full running count so the assumed per-model share stays
-// accurate.
+// least-recently-used) models from candidates until sampledMB+extraMB would
+// drop to or below the limit. extraMB is memory not yet in the sample that
+// must also fit: reservations for loading models and the incoming target.
+//
+// Each evicted model is assumed to free its estimate (see estimateMB). A
+// model with no estimate is assumed to free an equal share of what the known
+// estimates of the resident (ready or stopping) models in pool do not account
+// for, split across every model in pool with no estimate. pool is the full
+// running set, which may be larger than candidates.
 //
 // Candidates inside their grace period (see readySince) are tried after
 // every other candidate regardless of priority, but are still evicted if
 // nothing else is left.
-//
-// Only sampledMB is divided into shares: reservedMB stands for models that
-// have not loaded yet, which evicting a ready model cannot free.
-func (s *budgetSwapper) pickEvictions(candidates []string, sampledMB, reservedMB int64, shareDivisor int) []string {
-	if shareDivisor == 0 {
+func (s *budgetSwapper) pickEvictions(candidates, pool []string, sampledMB, extraMB int64) []string {
+	if len(pool) == 0 {
 		return nil
 	}
 
@@ -662,16 +800,41 @@ func (s *budgetSwapper) pickEvictions(candidates []string, sampledMB, reservedMB
 	}
 	sorted := append(s.sortByPriorityAndLRU(unprotected), s.sortByPriorityAndLRU(protected)...)
 
-	shareMB := sampledMB / int64(shareDivisor)
+	estimates := make(map[string]int64, len(pool))
+	var knownResidentMB int64
+	unknown := 0
+	for _, id := range pool {
+		est, ok := s.estimateMB(id)
+		if !ok {
+			unknown++
+			continue
+		}
+		estimates[id] = est
+		if p, ok := s.processes[id]; ok {
+			if st := p.State(); st == process.StateReady || st == process.StateStopping {
+				knownResidentMB += est
+			}
+		}
+	}
+	var shareMB int64
+	if unknown > 0 {
+		shareMB = max(0, sampledMB-knownResidentMB) / int64(unknown)
+	}
 
-	usedMB := sampledMB + reservedMB
+	usedMB := sampledMB + extraMB
 	var evict []string
 	for _, m := range sorted {
 		if usedMB <= s.limitMB {
 			break
 		}
 		evict = append(evict, m)
-		usedMB -= shareMB
+		if est, ok := estimates[m]; ok {
+			usedMB -= est
+		} else if est, ok := s.estimateMB(m); ok {
+			usedMB -= est // candidate outside pool
+		} else {
+			usedMB -= shareMB
+		}
 	}
 	return evict
 }
@@ -700,13 +863,13 @@ func (s *budgetSwapper) OnSwapStart(target string, running, evict []string) {
 	}
 	switch {
 	case len(evict) > 0:
-		s.logger.Infof("budget: model=%s usedMB=%d reservedMB=%d limitMB=%d evict=%v", target, d.sample.mb, d.reserved, s.limitMB, evict)
+		s.logger.Infof("budget: model=%s usedMB=%d reservedMB=%d targetMB=%d limitMB=%d evict=%v", target, d.sample.mb, d.reserved, d.targetMB, s.limitMB, evict)
 	case len(running) == 0:
 		s.logger.Infof("budget: model=%s starting (no models running)", target)
 	case d.sample.src == sourceNone:
 		s.logger.Debugf("budget: model=%s starting (no memory sample available yet)", target)
 	default:
-		s.logger.Debugf("budget: model=%s fits without eviction (usedMB=%d reservedMB=%d limitMB=%d)", target, d.sample.mb, d.reserved, s.limitMB)
+		s.logger.Debugf("budget: model=%s fits without eviction (usedMB=%d reservedMB=%d targetMB=%d limitMB=%d)", target, d.sample.mb, d.reserved, d.targetMB, s.limitMB)
 	}
 }
 

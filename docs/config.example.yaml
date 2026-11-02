@@ -887,9 +887,14 @@ routing:
       # rocm-smi, LACT, ...) — the same multi-vendor sampling used for the
       # Performance dashboard — so this router requires performance
       # monitoring to be enabled (`performance.disabled: false`, the
-      # default). It is total VRAM used across all GPUs, not per-model: GPU
-      # tools don't expose a reliable per-process breakdown across vendors,
-      # so each evicted model is assumed to free an equal share of the total.
+      # default). The limit applies to total VRAM used across all GPUs.
+      #
+      # Each model's size is estimated from, in order: sizeMB below, its own
+      # VRAM use read per process from nvidia-smi (NVIDIA only), or the median
+      # of what it added to total usage on recent loads. With an estimate, the
+      # requested model's size is counted before it loads and each evicted
+      # model frees its own size; models with no estimate are assumed to free
+      # an equal share of whatever the known sizes do not account for.
       # Because the limit is the sum across all GPUs, on a multi-GPU host one
       # card can run out of memory while the total is still under limitMB.
       #
@@ -903,8 +908,9 @@ routing:
       #
       # Solver behaviour (runs when a model is requested):
       #   1. If the requested model is already running, forward immediately. Done.
-      #   2. If current total VRAM used fits under limitMB, no eviction needed.
-      #      Start it. Forward request.
+      #   2. If current total VRAM used, plus the estimated size of models
+      #      still loading and of the requested model, fits under limitMB, no
+      #      eviction needed. Start it. Forward request.
       #   3. Otherwise, evict running models lowest-priority-first (ties broken
       #      by least-recently-used) until the estimate fits. Because the
       #      requested model must load now, eviction proceeds through
@@ -914,7 +920,9 @@ routing:
       # limitMB is a soft cap: if VRAM is still over limitMB after evicting every
       # other model, the requested model still runs.
       #
-      # limitMB is the total memory cap in megabytes.
+      # limitMB is the total memory cap in megabytes. Set it below physical
+      # VRAM: a model with no size estimate yet is admitted against current
+      # usage only, and may fail to load before the periodic check evicts.
       #
       # Priorities can be set two ways, and both can be mixed in one config:
       #   1. In the budget.models block below.
@@ -929,6 +937,9 @@ routing:
         models:
           gemma-model:
             priority: 10 # kept loaded, evicted last
+            # sizeMB: optional expected footprint once loaded, in MB
+            # - default 0: measured per process (nvidia-smi) or learned
+            sizeMB: 9000
           qwen-model:
             priority: 5
           mistral-model:

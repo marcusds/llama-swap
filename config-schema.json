@@ -120,7 +120,7 @@
         },
         "budgetConfig": {
             "type": "object",
-            "description": "Priority-based router, selected with routing.router.use: budget. Tracks a total VRAM cap and evicts lowest-priority running models when starting a new model would exceed limitMB. Total VRAM used is measured live from the host's GPU monitor (nvidia-smi, rocm-smi, LACT, ...); requires performance monitoring to be enabled.",
+            "description": "Priority-based router, selected with routing.router.use: budget. Tracks a total VRAM cap and evicts lowest-priority running models when starting a new model would exceed limitMB. Total VRAM used is measured live from the host's GPU monitor (nvidia-smi, rocm-smi, LACT, ...); requires performance monitoring to be enabled. Per-model sizes come from sizeMB, per-process nvidia-smi data, or learned history.",
             "required": [
                 "limitMB"
             ],
@@ -132,7 +132,7 @@
                 },
                 "models": {
                     "type": "object",
-                    "description": "Per-model eviction priority. Keys must be model IDs defined in models. Models not listed default to priority: 0, unless the model sets its own top-level priority field. Entries here take precedence over a model's own priority field.",
+                    "description": "Per-model eviction priority and optional size. Keys must be model IDs defined in models. Models not listed default to priority: 0, unless the model sets its own top-level priority field. Entries here take precedence over a model's own priority field.",
                     "additionalProperties": {
                         "type": "object",
                         "properties": {
@@ -140,6 +140,12 @@
                                 "type": "integer",
                                 "default": 0,
                                 "description": "Higher priority models are evicted last. Ties broken by least-recently-used."
+                            },
+                            "sizeMB": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "default": 0,
+                                "description": "Expected memory footprint once loaded, in megabytes. Counted before the model loads, so admission makes room for it in advance. 0 (default) means unset: the size is read per process from nvidia-smi where available, or learned from recent loads."
                             }
                         },
                         "additionalProperties": false

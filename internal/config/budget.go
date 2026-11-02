@@ -14,28 +14,44 @@ type BudgetConfig struct {
 	Models  map[string]BudgetModel `yaml:"models"`  // key is model ID
 }
 
-// BudgetModel declares a model's eviction priority. Higher priority
-// models are evicted last. Memory usage itself is measured live from the
-// running process (RSS), not declared here.
+// BudgetModel declares a model's eviction priority and, optionally, its
+// expected memory footprint.
 type BudgetModel struct {
-	Priority int `yaml:"priority"`
+	// Priority: higher priority models are evicted last. nil means unset,
+	// which falls back to the model's own priority field, then 0.
+	Priority *int `yaml:"priority"`
+	// SizeMB is the model's expected memory footprint once loaded. 0 means
+	// unset: the router measures or learns it instead.
+	SizeMB int64 `yaml:"sizeMB"`
+}
+
+// PriorityOrZero returns the entry's priority, or 0 when unset.
+func (m BudgetModel) PriorityOrZero() int {
+	if m.Priority == nil {
+		return 0
+	}
+	return *m.Priority
 }
 
 // MergeModelPriorities folds per-model `priority:` settings into
-// mb.Models so the router only has to consult one map. An explicit entry
-// under budget.models wins over the model's own `priority:` field.
+// mb.Models so the router only has to consult one map. A priority set
+// under budget.models wins over the model's own `priority:` field; an entry
+// there that only sets sizeMB still picks up the model's priority.
 func MergeModelPriorities(mb *BudgetConfig, models map[string]ModelConfig) {
 	for modelID, modelConfig := range models {
 		if modelConfig.Priority == nil {
 			continue
 		}
-		if _, exists := mb.Models[modelID]; exists {
+		entry, exists := mb.Models[modelID]
+		if exists && entry.Priority != nil {
 			continue
 		}
 		if mb.Models == nil {
 			mb.Models = make(map[string]BudgetModel)
 		}
-		mb.Models[modelID] = BudgetModel{Priority: *modelConfig.Priority}
+		p := *modelConfig.Priority
+		entry.Priority = &p
+		mb.Models[modelID] = entry
 	}
 }
 
@@ -45,9 +61,12 @@ func ValidateBudget(mb BudgetConfig, models map[string]ModelConfig) error {
 		return fmt.Errorf("budget.limitMB must be a positive number of megabytes, got %d", mb.LimitMB)
 	}
 
-	for modelID := range mb.Models {
+	for modelID, entry := range mb.Models {
 		if _, exists := models[modelID]; !exists {
 			return fmt.Errorf("budget.models: unknown model %q", modelID)
+		}
+		if entry.SizeMB < 0 {
+			return fmt.Errorf("budget.models.%s.sizeMB must be >= 0, got %d", modelID, entry.SizeMB)
 		}
 	}
 

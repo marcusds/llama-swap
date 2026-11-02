@@ -912,7 +912,7 @@ func TestBudgetSwapper_GracePeriodProtectsJustLoadedModel(t *testing.T) {
 	s := newTestBudgetSwapper(1000, priority, processes, 1500)
 	s.recordReadySince([]string{"mtp"}, time.Now()) // mtp just became ready
 
-	evict := s.pickEvictions([]string{"nomic", "dflash", "mtp"}, 1500, 0, 3)
+	evict := s.pickEvictions([]string{"nomic", "dflash", "mtp"}, []string{"nomic", "dflash", "mtp"}, 1500, 0)
 	if len(evict) == 0 || evict[0] == "mtp" {
 		t.Fatalf("evict=%v want mtp deferred to last despite its lower priority (it just loaded)", evict)
 	}
@@ -934,7 +934,7 @@ func TestBudgetSwapper_GracePeriodExpires(t *testing.T) {
 	s := newTestBudgetSwapper(1000, priority, processes, 1500)
 	s.recordReadySince([]string{"b"}, time.Now().Add(-time.Hour)) // long past the grace period
 
-	evict := s.pickEvictions([]string{"a", "b"}, 1500, 0, 2)
+	evict := s.pickEvictions([]string{"a", "b"}, []string{"a", "b"}, 1500, 0)
 	if len(evict) == 0 || evict[0] != "b" {
 		t.Fatalf("evict=%v want b first (its grace period has long since expired, so priority applies normally)", evict)
 	}
@@ -953,7 +953,7 @@ func TestBudgetSwapper_GracePeriodStillEvictsIfNothingElseAvailable(t *testing.T
 	s := newTestBudgetSwapper(1000, map[string]int{"a": 1}, processes, 1500)
 	s.recordReadySince([]string{"a"}, time.Now())
 
-	evict := s.pickEvictions([]string{"a"}, 1500, 0, 1)
+	evict := s.pickEvictions([]string{"a"}, []string{"a"}, 1500, 0)
 	if len(evict) != 1 || evict[0] != "a" {
 		t.Fatalf("evict=%v want [a] (only candidate, grace period must not block eviction entirely)", evict)
 	}
@@ -1399,7 +1399,7 @@ func TestBudgetSwapper_OnSwapStartLogsDecidedEvictSet(t *testing.T) {
 	usedMB.Store(100) // a newer sample would decide on no eviction
 	s.OnSwapStart("c", running, evict)
 
-	if want := "budget: model=c usedMB=1500 reservedMB=0 limitMB=1000 evict=[a]"; !bytes.Contains(logs.Bytes(), []byte(want)) {
+	if want := "budget: model=c usedMB=1500 reservedMB=0 targetMB=0 limitMB=1000 evict=[a]"; !bytes.Contains(logs.Bytes(), []byte(want)) {
 		t.Errorf("log=%q want it to contain %q", logs.String(), want)
 	}
 }

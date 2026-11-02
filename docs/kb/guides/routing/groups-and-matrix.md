@@ -3,7 +3,7 @@ title: Running several models at once with groups, matrix, capacity and budget
 summary: Choosing between group, matrix, capacity and budget routers, and how each decides what gets unloaded.
 category: guides
 tags: [routing, groups, matrix, capacity, budget, priority, concurrency, swap, vram, memory]
-config_keys: [routing, routing.router.use, routing.router.settings.groups, routing.router.settings.matrix, routing.router.settings.capacity.pools, routing.router.settings.budget.limitMB, routing.router.settings.budget.models, models.*.capacities, models.*.evict_cost, models.*.priority, routing.scheduler.settings.fifo.priority]
+config_keys: [routing, routing.router.use, routing.router.settings.groups, routing.router.settings.matrix, routing.router.settings.capacity.pools, routing.router.settings.budget.limitMB, routing.router.settings.budget.models, routing.router.settings.budget.models.*.sizeMB, models.*.capacities, models.*.evict_cost, models.*.priority, routing.scheduler.settings.fifo.priority]
 updated: 2026-11-02
 ---
 
@@ -262,17 +262,30 @@ versus a mid-size LLM plus TTS. Groups cannot express that; matrix can.
 Use **capacity** when every combination within the declared resource limits is
 valid and maintaining explicit matrix combinations would be tedious.
 
-Use **budget** when you would rather not declare sizes at all and are happy to
-evict by priority against measured memory use.
+Use **budget** when you would rather not maintain exact sizes and are happy to
+evict by priority against measured memory use. Sizes are optional there: it
+measures or learns them, and a declared `sizeMB` makes admission predictable.
 
 ## `budget` — measured memory cap, priority eviction
 
-Set a total memory cap and give models a priority. Unlike `capacity`, usage is
-measured live from the host's GPU monitor, so it needs performance monitoring
-enabled. When a request would push usage over `limitMB`, running models are
-evicted lowest priority first (ties: least recently used) until it fits. A
-periodic check also evicts idle models while usage stays over the limit; it
-never evicts a model that is serving or has requests waiting for it.
+Set a total memory cap and give models a priority. Usage is measured live from
+the host's GPU monitor, so it needs performance monitoring enabled. When a
+request would push usage over `limitMB`, running models are evicted lowest
+priority first (ties: least recently used) until it fits. A periodic check
+also evicts idle models while usage stays over the limit; it never evicts a
+model that is serving or has requests waiting for it.
+
+Each model's size is estimated, in this order:
+
+1. `sizeMB` under `budget.models`, if set.
+2. Its own VRAM use, read per process from `nvidia-smi` (NVIDIA only; matched
+   through the model's process tree, so `sh -c` wrappers work).
+3. The median of what it added to total usage on recent loads (needs 3).
+
+With an estimate, the requested model's size is counted **before** it loads,
+and each evicted model is assumed to free its own size. Without one, the
+request is admitted against current usage only and overshoot is caught by the
+periodic check after the load.
 
 ```yaml
 routing:
@@ -282,8 +295,8 @@ routing:
       budget:
         limitMB: 24576   # 24GB
         models:
-          gemma: {priority: 10}   # evicted last
-          qwen: {priority: 1}
+          gemma: {priority: 10, sizeMB: 9000}   # evicted last
+          qwen: {priority: 1}                   # size measured or learned
 models:
   mistral:
     cmd: llama-server -m /models/mistral.gguf --port ${PORT}
@@ -295,9 +308,15 @@ What to watch for:
 - `limitMB` is VRAM **summed across all GPUs**. On a multi-GPU host one card
   can run out of memory while the total is still under the limit; use
   `capacity` with one pool per GPU if that matters.
+- Set `limitMB` below physical VRAM. A model with no estimate yet is admitted
+  against current usage, and if it does not fit physically it fails to load
+  (or llama.cpp offloads layers to CPU) before the periodic check can evict.
 - It is a soft cap: the requested model still runs if usage is over after
   everything else is evicted. Usage counts everything on the GPU, not only
   llama-swap models, so leave headroom.
+- Per-process measurement does not see models run with `docker run`: the
+  container is not a child of the command llama-swap starts. Declare `sizeMB`
+  for those, or let the router learn them.
 - On unified-memory hosts (GPU reports 0MB used while a model is loaded) the
   cap applies to system memory used instead, and a warning is logged once. A
   discrete GPU that reads 0MB while idle is not treated as unified.

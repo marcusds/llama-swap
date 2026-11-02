@@ -14,8 +14,8 @@ func TestValidateBudget_Basic(t *testing.T) {
 	mb := BudgetConfig{
 		LimitMB: 16000,
 		Models: map[string]BudgetModel{
-			"gemma": {Priority: 10},
-			"qwen":  {Priority: 5},
+			"gemma": {Priority: intPtr(10)},
+			"qwen":  {Priority: intPtr(5)},
 		},
 	}
 
@@ -70,8 +70,8 @@ routing:
 	require.NoError(t, err)
 	require.NotNil(t, cfg.Routing.Router.Settings.Budget)
 	assert.Equal(t, int64(16*1024), cfg.Routing.Router.Settings.Budget.LimitMB)
-	assert.Equal(t, 10, cfg.Routing.Router.Settings.Budget.Models["gemma"].Priority)
-	assert.Equal(t, 1, cfg.Routing.Router.Settings.Budget.Models["qwen"].Priority)
+	assert.Equal(t, 10, cfg.Routing.Router.Settings.Budget.Models["gemma"].PriorityOrZero())
+	assert.Equal(t, 1, cfg.Routing.Router.Settings.Budget.Models["qwen"].PriorityOrZero())
 }
 
 func TestMergeModelPriorities_FromModelConfig(t *testing.T) {
@@ -83,8 +83,8 @@ func TestMergeModelPriorities_FromModelConfig(t *testing.T) {
 	mb := BudgetConfig{LimitMB: 16000}
 	MergeModelPriorities(&mb, models)
 
-	assert.Equal(t, 10, mb.Models["gemma"].Priority)
-	assert.Equal(t, 3, mb.Models["qwen"].Priority)
+	assert.Equal(t, 10, mb.Models["gemma"].PriorityOrZero())
+	assert.Equal(t, 3, mb.Models["qwen"].PriorityOrZero())
 
 	// models without a priority are not added, and default to 0 at lookup
 	_, found := mb.Models["mistral"]
@@ -100,11 +100,11 @@ func TestMergeModelPriorities_BudgetBlockWins(t *testing.T) {
 
 	mb := BudgetConfig{
 		LimitMB: 16000,
-		Models:  map[string]BudgetModel{"gemma": {Priority: 99}},
+		Models:  map[string]BudgetModel{"gemma": {Priority: intPtr(99)}},
 	}
 	MergeModelPriorities(&mb, models)
 
-	assert.Equal(t, 99, mb.Models["gemma"].Priority)
+	assert.Equal(t, 99, mb.Models["gemma"].PriorityOrZero())
 }
 
 func TestMergeModelPriorities_ZeroIsExplicit(t *testing.T) {
@@ -117,7 +117,7 @@ func TestMergeModelPriorities_ZeroIsExplicit(t *testing.T) {
 
 	entry, found := mb.Models["gemma"]
 	require.True(t, found)
-	assert.Equal(t, 0, entry.Priority)
+	assert.Equal(t, 0, entry.PriorityOrZero())
 }
 
 func TestBudget_ModelLevelPriorityFromYAML(t *testing.T) {
@@ -150,10 +150,10 @@ models:
 	mb := cfg.Routing.Router.Settings.Budget
 	require.NotNil(t, mb)
 	assert.Equal(t, int64(90*1024), mb.LimitMB)
-	assert.Equal(t, 10, mb.Models["gemma"].Priority)
-	assert.Equal(t, 5, mb.Models["qwen"].Priority)
+	assert.Equal(t, 10, mb.Models["gemma"].PriorityOrZero())
+	assert.Equal(t, 5, mb.Models["qwen"].PriorityOrZero())
 	// budget.models entry wins over the model's own priority
-	assert.Equal(t, 7, mb.Models["mistral"].Priority)
+	assert.Equal(t, 7, mb.Models["mistral"].PriorityOrZero())
 
 	_, found := mb.Models["llama"]
 	assert.False(t, found)
@@ -210,4 +210,54 @@ routing:
 `))
 	require.NoError(t, err)
 	assert.Empty(t, BudgetWarnings(cfg))
+}
+
+func intPtr(v int) *int { return &v }
+
+func TestBudget_SizeMBParsedAndValidated(t *testing.T) {
+	cfg, err := LoadConfigFromReader(strings.NewReader(`
+models:
+  gemma:
+    cmd: echo gemma ${PORT}
+    priority: 4
+  qwen:
+    cmd: echo qwen ${PORT}
+routing:
+  router:
+    use: budget
+    settings:
+      budget:
+        limitMB: 24000
+        models:
+          gemma:
+            sizeMB: 9000
+          qwen:
+            priority: 2
+            sizeMB: 4000
+`))
+	if !assert.NoError(t, err) {
+		return
+	}
+	mb := cfg.Routing.Router.Settings.Budget
+	assert.Equal(t, int64(9000), mb.Models["gemma"].SizeMB)
+	// an entry that only sets sizeMB still picks up the model's own priority
+	assert.Equal(t, 4, mb.Models["gemma"].PriorityOrZero())
+	assert.Equal(t, int64(4000), mb.Models["qwen"].SizeMB)
+	assert.Equal(t, 2, mb.Models["qwen"].PriorityOrZero())
+
+	_, err = LoadConfigFromReader(strings.NewReader(`
+models:
+  gemma:
+    cmd: echo gemma ${PORT}
+routing:
+  router:
+    use: budget
+    settings:
+      budget:
+        limitMB: 24000
+        models:
+          gemma:
+            sizeMB: -1
+`))
+	assert.ErrorContains(t, err, "sizeMB must be >= 0")
 }

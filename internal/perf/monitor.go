@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
@@ -46,6 +47,14 @@ type Monitor struct {
 	// Tests replace both.
 	gpuStats gpuStatsFunc
 	gpuWait  gpuWaitFunc
+
+	// procVRAMQuery queries per-process VRAM; nil when unavailable on this
+	// host. procWanted is set by the first ProcessVRAMMB call, and the query
+	// only runs after that. procVRAM/procVRAMAt are guarded by mutex.
+	procVRAMQuery procVRAMFunc
+	procWanted    atomic.Bool
+	procVRAM      map[int]int64
+	procVRAMAt    time.Time
 }
 
 func ringCapacity(c config.PerformanceConfig) int {
@@ -77,6 +86,8 @@ func New(c config.PerformanceConfig, logger *logmon.Monitor) (*Monitor, error) {
 
 		gpuStats: getGpuStats,
 		gpuWait:  waitOrDone,
+
+		procVRAMQuery: nvidiaProcVRAM(),
 	}, nil
 }
 
@@ -106,6 +117,7 @@ func (m *Monitor) UpdateConfig(newConf config.PerformanceConfig) {
 	capacity := ringCapacity(newConf)
 	m.sysRing = ring.NewBuffer[SysStat](capacity)
 	m.gpuRing = ring.NewBuffer[[]GpuStat](capacity)
+	m.procVRAM, m.procVRAMAt = nil, time.Time{}
 	m.mutex.Unlock()
 	if !newConf.Disabled {
 		m.Start()
@@ -170,6 +182,9 @@ func (m *Monitor) Start() {
 	}()
 
 	go m.collectGpuStats(m.stopCtx, m.conf.Every)
+	if m.procVRAMQuery != nil {
+		go m.pollProcVRAM(m.stopCtx, m.conf.Every, m.procVRAMQuery)
+	}
 }
 
 // collectGpuStats reads GPU stats until ctx is done. A collector that stops
