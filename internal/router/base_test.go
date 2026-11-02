@@ -119,7 +119,7 @@ func (s *stubPlanner) EvictionFor(target string, _ []string) []string {
 	}
 	return s.evict[target]
 }
-func (s *stubPlanner) OnSwapStart(string, []string) {}
+func (s *stubPlanner) OnSwapStart(string, []string, []string) {}
 
 func newTestBase(t *testing.T, processes map[string]process.Process, planner scheduler.Swapper) *baseRouter {
 	t.Helper()

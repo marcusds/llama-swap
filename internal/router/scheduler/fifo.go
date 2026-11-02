@@ -47,6 +47,11 @@ type FIFO struct {
 	inFlight map[string]int
 	queued   []HandlerReq
 
+	// evicting holds models claimed by EvictIdle whose processes are being
+	// stopped outside of a swap. Requests for them are queued until
+	// OnEvictDone, so they are never granted a process that is about to die.
+	evicting map[string]bool
+
 	nextGeneration uint64
 }
 
@@ -73,6 +78,7 @@ func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.Fi
 		active:   make(map[string]*activeSwap),
 		reserved: make(map[string]int),
 		inFlight: make(map[string]int),
+		evicting: make(map[string]bool),
 	}
 }
 
@@ -112,6 +118,13 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 	if sw, ok := s.active[req.Model]; ok {
 		s.logger.Debugf("%s: joining in-flight swap for model %s (%d waiters)", s.name, req.Model, len(sw.waiters)+1)
 		sw.waiters = append(sw.waiters, req)
+		return
+	}
+
+	// Being stopped by EvictIdle — wait for OnEvictDone, then start fresh.
+	if s.evicting[req.Model] {
+		s.logger.Debugf("%s: queuing request for model %s (being evicted)", s.name, req.Model)
+		s.enqueue(req)
 		return
 	}
 
@@ -284,9 +297,56 @@ func (s *FIFO) OnShutdown(err error) {
 	}
 }
 
-// InFlightCount implements scheduler.Scheduler.
-func (s *FIFO) InFlightCount(modelID string) int {
-	return s.inFlight[modelID]
+// EvictIdle implements scheduler.Scheduler.
+func (s *FIFO) EvictIdle(candidates []string, choose func(idle []string) []string) []string {
+	idle := make([]string, 0, len(candidates))
+	for _, id := range candidates {
+		if s.busy(id) {
+			continue
+		}
+		if st, ok := s.effects.ModelState(id); !ok || st != process.StateReady {
+			continue
+		}
+		idle = append(idle, id)
+	}
+	if len(idle) == 0 {
+		return nil
+	}
+	var evicted []string
+	for _, id := range choose(idle) {
+		// choose may only pick from idle.
+		if !containsString(idle, id) || s.evicting[id] {
+			continue
+		}
+		s.evicting[id] = true
+		evicted = append(evicted, id)
+	}
+	return evicted
+}
+
+// busy reports whether modelID has requests in flight or waiting, a swap
+// targeting it, or is already being stopped by a swap or EvictIdle.
+func (s *FIFO) busy(modelID string) bool {
+	if s.inFlight[modelID] > 0 || s.reserved[modelID] > 0 || s.evicting[modelID] {
+		return true
+	}
+	if _, ok := s.active[modelID]; ok {
+		return true
+	}
+	for _, sw := range s.active {
+		if containsString(sw.evict, modelID) {
+			return true
+		}
+	}
+	return false
+}
+
+// OnEvictDone implements scheduler.Scheduler.
+func (s *FIFO) OnEvictDone(ids []string) {
+	for _, id := range ids {
+		delete(s.evicting, id)
+	}
+	s.drainQueue()
 }
 
 // grantHandler hands the caller a tracked handler for modelID and, only if the
@@ -377,8 +437,8 @@ func (s *FIFO) limit(modelID string) int {
 }
 
 // startSwap records the swap as active and launches it via Effects. running is
-// the set EvictionFor saw, forwarded to OnSwapStart so the planner logs against
-// the same picture it decided on.
+// the set EvictionFor saw and evict is what it decided, forwarded to
+// OnSwapStart so the planner logs the decision that was acted on.
 func (s *FIFO) startSwap(initial HandlerReq, evict, running []string) {
 	s.nextGeneration++
 	sw := &activeSwap{
@@ -388,7 +448,7 @@ func (s *FIFO) startSwap(initial HandlerReq, evict, running []string) {
 		waiters:    []HandlerReq{initial},
 	}
 	s.active[initial.Model] = sw
-	s.planner.OnSwapStart(initial.Model, running)
+	s.planner.OnSwapStart(initial.Model, running, evict)
 	sw.cancel = s.effects.StartSwap(initial.Model, sw.generation, evict)
 }
 
@@ -430,6 +490,10 @@ func (s *FIFO) drainQueue() {
 		if sw, ok := s.active[req.Model]; ok {
 			s.logger.Debugf("%s: queued request for model %s now joining in-flight swap", s.name, req.Model)
 			sw.waiters = append(sw.waiters, req)
+			continue
+		}
+		if s.evicting[req.Model] {
+			remaining = append(remaining, req)
 			continue
 		}
 		running := s.runningSet(req.Model)

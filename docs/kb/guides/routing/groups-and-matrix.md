@@ -3,7 +3,7 @@ title: Running several models at once with groups, matrix, capacity and budget
 summary: Choosing between group, matrix, capacity and budget routers, and how each decides what gets unloaded.
 category: guides
 tags: [routing, groups, matrix, capacity, budget, priority, concurrency, swap, vram, memory]
-config_keys: [routing, routing.router.use, routing.router.settings.groups, routing.router.settings.matrix, routing.router.settings.capacity.pools, routing.router.settings.budget.limitMB, routing.router.settings.budget.models, models.*.capacities, models.*.evict_cost, models.*.priority]
+config_keys: [routing, routing.router.use, routing.router.settings.groups, routing.router.settings.matrix, routing.router.settings.capacity.pools, routing.router.settings.budget.limitMB, routing.router.settings.budget.models, models.*.capacities, models.*.evict_cost, models.*.priority, routing.scheduler.settings.fifo.priority]
 updated: 2026-11-02
 ---
 
@@ -262,6 +262,51 @@ versus a mid-size LLM plus TTS. Groups cannot express that; matrix can.
 Use **capacity** when every combination within the declared resource limits is
 valid and maintaining explicit matrix combinations would be tedious.
 
+Use **budget** when you would rather not declare sizes at all and are happy to
+evict by priority against measured memory use.
+
+## `budget` — measured memory cap, priority eviction
+
+Set a total memory cap and give models a priority. Unlike `capacity`, usage is
+measured live from the host's GPU monitor, so it needs performance monitoring
+enabled. When a request would push usage over `limitMB`, running models are
+evicted lowest priority first (ties: least recently used) until it fits. A
+periodic check also evicts idle models while usage stays over the limit; it
+never evicts a model that is serving or has requests waiting for it.
+
+```yaml
+routing:
+  router:
+    use: budget
+    settings:
+      budget:
+        limitMB: 24576   # 24GB
+        models:
+          gemma: {priority: 10}   # evicted last
+          qwen: {priority: 1}
+models:
+  mistral:
+    cmd: llama-server -m /models/mistral.gguf --port ${PORT}
+    priority: 5   # same as a budget.models entry; the budget entry wins
+```
+
+What to watch for:
+
+- `limitMB` is VRAM **summed across all GPUs**. On a multi-GPU host one card
+  can run out of memory while the total is still under the limit; use
+  `capacity` with one pool per GPU if that matters.
+- It is a soft cap: the requested model still runs if usage is over after
+  everything else is evicted. Usage counts everything on the GPU, not only
+  llama-swap models, so leave headroom.
+- On unified-memory hosts (GPU reports 0MB used while a model is loaded) the
+  cap applies to system memory used instead, and a warning is logged once. A
+  discrete GPU that reads 0MB while idle is not treated as unified.
+- Models with no priority default to 0. This `priority` is eviction order. It
+  is unrelated to `routing.scheduler.settings.fifo.priority`, which orders
+  queued requests (see below). `models.*.priority` and a
+  `routing.router.settings.budget` block are ignored unless `use: budget`; a
+  warning is logged when they are set under another router.
+
 ## Request ordering
 
 Queued requests are FIFO. You can give some models priority:
@@ -285,33 +330,3 @@ Higher numbers are serviced first. Models default to 0.
 - `guides/model-runtime/ttl-and-unloading` — reclaiming VRAM from idle models
 - `guides/tools/kubeswap` — the kubeswap Helm chart, whose
   `config.matrix` builds this section from the model roster
-
-## `budget` — measured memory cap, priority eviction
-
-Set a total memory cap and give models a priority. Unlike `capacity`, usage is
-measured live from the host's GPU monitor (VRAM used across all GPUs, falling
-back to system memory on unified-memory hosts), so it needs performance
-monitoring enabled. When a request would push usage over `limitMB`, running
-models are evicted lowest priority first (ties: least recently used) until it
-fits. A model that is serving a request is never evicted by the periodic check.
-
-```yaml
-routing:
-  router:
-    use: budget
-    settings:
-      budget:
-        limitMB: 24576   # 24GB
-        models:
-          gemma: {priority: 10}   # evicted last
-          qwen: {priority: 1}
-models:
-  mistral:
-    cmd: llama-server -m /models/mistral.gguf --port ${PORT}
-    priority: 5   # same as a budget.models entry; the budget entry wins
-```
-
-`limitMB` is a soft cap: the requested model still runs if it is over after
-everything else is evicted. Models with no priority default to 0. Usage counts
-everything on the GPU (or all system memory), not only llama-swap models, so
-leave headroom.

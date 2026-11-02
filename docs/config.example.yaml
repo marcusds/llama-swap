@@ -643,7 +643,9 @@ models:
   "priority-model":
     # priority: eviction priority for the budget router
     # - optional, default: 0
-    # - only used when the budget router is active
+    # - only used when the budget router is active; a warning is logged
+    #   when it is set under another router
+    # - not the request queue order, see routing.scheduler.settings.fifo.priority
     # - higher priority models are evicted last, ties broken by
     #   least-recently-used
     # - an entry for this model under budget.models wins over this field
@@ -888,6 +890,8 @@ routing:
       # default). It is total VRAM used across all GPUs, not per-model: GPU
       # tools don't expose a reliable per-process breakdown across vendors,
       # so each evicted model is assumed to free an equal share of the total.
+      # Because the limit is the sum across all GPUs, on a multi-GPU host one
+      # card can run out of memory while the total is still under limitMB.
       #
       # Hosts with unified CPU/GPU memory (NVIDIA Grace-Blackwell GB10, for
       # example) have no separate framebuffer, so nvidia-smi reports 0MB used

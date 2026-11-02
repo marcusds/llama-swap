@@ -62,7 +62,7 @@ func BenchmarkMatrixSwapPath(b *testing.B) {
 		running := runSets[i%len(runSets)]
 		i++
 		benchmarkEvict = swapper.EvictionFor("target-3", running)
-		swapper.OnSwapStart("target-3", running)
+		swapper.OnSwapStart("target-3", running, benchmarkEvict)
 	}
 }
 

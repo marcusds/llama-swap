@@ -158,3 +158,56 @@ models:
 	_, found := mb.Models["llama"]
 	assert.False(t, found)
 }
+
+// An inactive budget block is accepted like inactive capacity/matrix
+// settings, but reported as ignored.
+func TestBudget_InactiveSettingsWarn(t *testing.T) {
+	cfg, err := LoadConfigFromReader(strings.NewReader(`
+models:
+  gemma:
+    cmd: echo gemma ${PORT}
+routing:
+  router:
+    use: group
+    settings:
+      budget:
+        limitMB: 1000
+`))
+	require.NoError(t, err)
+	warnings := BudgetWarnings(cfg)
+	require.Len(t, warnings, 1)
+	assert.Contains(t, warnings[0], "routing.router.settings.budget is ignored")
+}
+
+func TestBudget_ModelPriorityWithoutBudgetRouterWarns(t *testing.T) {
+	cfg, err := LoadConfigFromReader(strings.NewReader(`
+models:
+  gemma:
+    cmd: echo gemma ${PORT}
+    priority: 10
+  qwen:
+    cmd: echo qwen ${PORT}
+`))
+	require.NoError(t, err)
+	warnings := BudgetWarnings(cfg)
+	require.Len(t, warnings, 1)
+	assert.Contains(t, warnings[0], "[gemma]")
+	assert.Contains(t, warnings[0], "fifo.priority")
+}
+
+func TestBudget_NoWarningsWhenBudgetActive(t *testing.T) {
+	cfg, err := LoadConfigFromReader(strings.NewReader(`
+models:
+  gemma:
+    cmd: echo gemma ${PORT}
+    priority: 10
+routing:
+  router:
+    use: budget
+    settings:
+      budget:
+        limitMB: 1000
+`))
+	require.NoError(t, err)
+	assert.Empty(t, BudgetWarnings(cfg))
+}

@@ -128,7 +128,7 @@
                 "limitMB": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Total VRAM cap across all GPUs, in megabytes."
+                    "description": "Total VRAM cap summed across all GPUs, in megabytes. On multi-GPU hosts one GPU can run out of memory while the total is under this limit."
                 },
                 "models": {
                     "type": "object",
@@ -627,7 +627,7 @@
                     "priority": {
                         "type": "integer",
                         "default": 0,
-                        "description": "budget eviction priority. Higher priority models are evicted last, ties broken by least-recently-used. Only used when the budget router is active. An entry for this model under budget.models takes precedence."
+                        "description": "budget eviction priority. Higher priority models are evicted last, ties broken by least-recently-used. Only used when the budget router is active. An entry for this model under budget.models takes precedence. Unrelated to routing.scheduler.settings.fifo.priority, which orders queued requests."
                     },
                     "timeouts": {
                         "$ref": "#/definitions/timeouts"

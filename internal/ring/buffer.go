@@ -32,8 +32,8 @@ func (r *Buffer[T]) Last() (T, bool) {
 	if r.size == 0 {
 		return zero, false
 	}
-	cap := len(r.buf)
-	return r.buf[(r.head+r.size-1)%cap], true
+	n := len(r.buf)
+	return r.buf[(r.head+r.size-1)%n], true
 }
 
 // Slice returns all entries in insertion order as a new slice.

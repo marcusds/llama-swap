@@ -103,4 +103,4 @@ func (p *groupSwapper) EvictionFor(target string, running []string) []string {
 	return result
 }
 
-func (p *groupSwapper) OnSwapStart(target string, running []string) {}
+func (p *groupSwapper) OnSwapStart(target string, running, evict []string) {}

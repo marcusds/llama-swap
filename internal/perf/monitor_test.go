@@ -596,3 +596,32 @@ func TestParseIoregOutput_MissingModel(t *testing.T) {
 	assert.Equal(t, 50.0, stat.GpuUtilPct)
 	assert.Equal(t, 1, stat.MemUsedMB)
 }
+
+// TestMonitor_UsedMBReportsSampleTime checks that the memory readings used by
+// the budget router carry the time their sample was taken, so callers can
+// tell a fresh sample from a re-read one.
+func TestMonitor_UsedMBReportsSampleTime(t *testing.T) {
+	m, err := New(config.PerformanceConfig{Every: 5 * time.Second}, newTestLogger())
+	require.NoError(t, err)
+	assert.Equal(t, 5*time.Second, m.Every())
+
+	_, _, ok := m.VRAMUsedMB()
+	assert.False(t, ok)
+	_, _, ok = m.SysMemUsedMB()
+	assert.False(t, ok)
+
+	t1 := time.Unix(100, 0)
+	t2 := time.Unix(101, 0)
+	m.gpuRing.Push([]GpuStat{{Timestamp: t1, MemUsedMB: 1000}, {Timestamp: t2, MemUsedMB: 500}})
+	m.sysRing.Push(SysStat{Timestamp: t1, MemUsedMB: 4000})
+
+	mb, at, ok := m.VRAMUsedMB()
+	require.True(t, ok)
+	assert.Equal(t, int64(1500), mb)
+	assert.Equal(t, t2, at, "newest per-GPU timestamp")
+
+	mb, at, ok = m.SysMemUsedMB()
+	require.True(t, ok)
+	assert.Equal(t, int64(4000), mb)
+	assert.Equal(t, t1, at)
+}

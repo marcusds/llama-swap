@@ -32,7 +32,7 @@ func (s *stubPlanner) EvictionFor(target string, _ []string) []string {
 	return s.evict[target]
 }
 
-func (s *stubPlanner) OnSwapStart(string, []string) {}
+func (s *stubPlanner) OnSwapStart(string, []string, []string) {}
 
 // grantRec is one GrantError / GrantServe call. err!=nil marks an error grant;
 // otherwise it is a serve grant and serve reports whether the caller received it.

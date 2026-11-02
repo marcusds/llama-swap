@@ -80,7 +80,7 @@ func TestCapacity_DecisionCache(t *testing.T) {
 	require.Zero(t, testing.AllocsPerRun(10, func() {
 		s.EvictionFor("x", snapshot)
 	}))
-	s.OnSwapStart("x", snapshot)
+	s.OnSwapStart("x", snapshot, evict)
 	require.Contains(t, logs.String(), "capacity: model=x evict=[a] pools=map[ram:10]")
 	require.Same(t, &evict[0], &s.lastEvict[0])
 
@@ -96,7 +96,7 @@ func TestCapacity_DecisionCache(t *testing.T) {
 	running = []string{"b"}
 	require.Empty(t, s.EvictionFor("y", running))
 	require.Zero(t, testing.AllocsPerRun(10, func() {
-		s.OnSwapStart("y", running)
+		s.OnSwapStart("y", running, nil)
 	}))
 	// An empty decision must not hide a later change in residents.
 	require.Equal(t, []string{"a"}, s.EvictionFor("y", []string{"a", "x"}))

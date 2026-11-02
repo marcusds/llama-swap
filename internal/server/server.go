@@ -256,6 +256,10 @@ func New(cfg config.Config, logs *logmon.Group, perfMon *perf.Monitor, st store.
 	var local router.LocalRouter
 	var err error
 
+	for _, w := range config.BudgetWarnings(cfg) {
+		logs.ProxyLogs.Warnf("config: %s", w)
+	}
+
 	switch cfg.Routing.Router.Use {
 	case "capacity":
 		local, err = router.NewCapacity(cfg, logs)

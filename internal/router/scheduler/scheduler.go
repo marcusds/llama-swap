@@ -38,9 +38,10 @@ type Swapper interface {
 	EvictionFor(target string, running []string) []string
 
 	// OnSwapStart runs once at the start of every swap, with the same running
-	// set EvictionFor was given for this decision. Planners may log their
-	// decision here at whatever verbosity they choose.
-	OnSwapStart(target string, running []string)
+	// set EvictionFor was given for this decision and the evict set the
+	// scheduler acted on. Planners may log their decision here at whatever
+	// verbosity they choose.
+	OnSwapStart(target string, running, evict []string)
 }
 
 // Scheduler decides what happens to each event the router's run loop receives.
@@ -66,14 +67,18 @@ type Scheduler interface {
 	// swap waiters and queued requests). Process teardown is the baseRouter's
 	// responsibility.
 	OnShutdown(err error)
-	// InFlightCount returns how many requests modelID's process is currently
-	// serving. OnRequest already avoids evicting a busy model on its own
-	// (conflictsWithInFlight defers the swap by queuing instead), so normal
-	// admission-time eviction never needs this. It exists for eviction paths
-	// outside that decision tree — periodic budget enforcement being
-	// the only one today — which have no other way to tell a model is
-	// mid-response before stopping it.
-	InFlightCount(modelID string) int
+	// EvictIdle atomically picks and claims models to evict outside of a
+	// swap (for example periodic budget enforcement). It filters candidates
+	// down to models that are ready and idle: no request in flight or waiting
+	// for them (queued, joined to a swap, or admitted), no swap targeting them
+	// and no swap already evicting them. choose receives that idle subset and
+	// returns the ones to evict. The returned models are marked as evicting:
+	// requests for them are queued until OnEvictDone. The caller must stop the
+	// returned processes and then report OnEvictDone.
+	EvictIdle(candidates []string, choose func(idle []string) []string) []string
+	// OnEvictDone reports that the processes claimed by EvictIdle have
+	// stopped, releasing requests queued behind them.
+	OnEvictDone(ids []string)
 }
 
 // Effects is implemented by the baseRouter. The scheduler calls back through it

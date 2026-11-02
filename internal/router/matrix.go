@@ -90,7 +90,7 @@ func (p *matrixSwapper) EvictionFor(target string, running []string) []string {
 	return p.solve(target, running).Evict
 }
 
-func (p *matrixSwapper) OnSwapStart(target string, running []string) {
+func (p *matrixSwapper) OnSwapStart(target string, running, _ []string) {
 	result := p.solve(target, running)
 	switch {
 	case len(result.Evict) > 0:

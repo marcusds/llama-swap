@@ -6,6 +6,7 @@ import (
 	"slices"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
@@ -14,23 +15,11 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/process"
 )
 
-// budgetCheckInterval is how often enforceBudgetPeriodically re-samples
-// usage independent of any swap, when nothing is actively loading. See that
-// method's doc comment for why this exists alongside the swap-start check in
-// EvictionFor.
-//
-// budgetActiveLoadCheckInterval is the tighter interval used instead
-// while at least one model is StateStarting. A load can push usage from under
-// budget to well over it in well under 15s, and the fixed interval leaves
-// that entire window unmonitored between ticks — which is exactly the shape
-// of the incident that motivated this: usage climbed to under 1GB free while
-// a load was in flight, with the periodic check having no reason to look
-// again for several more seconds. Checking more often only while a load is
-// actually in progress also gives observeAndLearn a tighter, cleaner
-// before/after window per tick — less time for unrelated host activity to
-// leak into a delta it's trying to attribute to a model (see the learned
-// field's doc comment on budgetSwapper for why that matters on the
-// unified-memory fallback).
+// budgetCheckInterval is how often enforceBudgetPeriodically runs while no
+// model is loading. budgetActiveLoadCheckInterval is the tighter interval used
+// while a model is StateStarting, since a load can push usage over the limit
+// quickly. The active interval is never shorter than the perf monitor's
+// sampling interval: checking more often would only re-read the same sample.
 const (
 	budgetCheckInterval           = 15 * time.Second
 	budgetActiveLoadCheckInterval = 2 * time.Second
@@ -40,43 +29,48 @@ type Budget struct {
 	*baseRouter
 	swapper *budgetSwapper
 
-	// lastEvictUsedMB is the usage sampled at the tick where
-	// enforceBudgetOnce last evicted, or 0 when the last tick evicted
-	// nothing. See enforceBudgetOnce for why a later tick that measures no
-	// drop must not evict again. Only touched by the single
-	// enforceBudgetPeriodically goroutine (and by tests, serially), so it
-	// needs no synchronization.
-	lastEvictUsedMB int64
+	// sampleEvery returns the perf monitor's sampling interval. nil in tests.
+	sampleEvery func() time.Duration
 
-	// prevReady and prevUsedMB are the ready-model set and usage sampled at
-	// the previous tick, used by observeAndLearn to attribute a usage delta
-	// to whatever models finished loading in between. prevOK is false until
-	// the first tick has run. Only touched by the single
-	// enforceBudgetPeriodically goroutine, so these need no synchronization
-	// (unlike swapper.learned, which observeAndLearn writes but EvictionFor
-	// reads from the run-loop goroutine).
-	prevReady  map[string]bool
-	prevUsedMB int64
-	prevOK     bool
+	// The fields below are only touched by the enforceBudgetPeriodically
+	// goroutine (and by tests, serially), so they need no synchronization.
 
-	// lastEvictReady is the ready-model set at the tick where enforceBudgetOnce
-	// last evicted, alongside lastEvictUsedMB. See enforceBudgetOnce: usage not
-	// dropping since that tick only means eviction isn't helping if the ready
-	// set hasn't changed either. If it has — some other model finished loading
-	// in between — that alone explains a rise that has nothing to do with
-	// whether the eviction worked, and pausing here would disable protection
-	// at exactly the moment a concurrent load burst needs it most.
-	lastEvictReady map[string]bool
+	// baseline is the last usage sample taken while every running model was
+	// ready, with nothing starting or stopping, and taken after the last
+	// observed state change. observeAndLearn attributes the rise from it to
+	// models that became ready since.
+	baseline *budgetSnapshot
+	// prevRunning and prevReady are the running and ready sets at the previous
+	// observeAndLearn call, used to detect state changes between calls.
+	prevRunning map[string]bool
+	prevReady   map[string]bool
+	// lastChangeAt is the latest known time the set of resident models
+	// changed. A sample taken before it does not reflect the current set.
+	lastChangeAt time.Time
 
-	// warnedEvictFreedNothing tracks whether the pause warning already fired
-	// for the current pause episode. Unlike warnLastModelOver (a structural
-	// condition that only a config change resolves, so warning once ever is
-	// enough), a pause episode ends whenever usage drops back under budget —
-	// see the usedMB<=limitMB branch in enforceBudgetOnce, which resets this
-	// alongside lastEvictUsedMB/lastEvictReady so a later, distinct pause
-	// episode warns again instead of logging silently.
+	// lastEvict describes the last periodic eviction, or nil when usage has
+	// been back under the limit since. See enforceBudgetOnce.
+	lastEvict *budgetEviction
+
+	// warnedEvictFreedNothing is set once the pause warning fired, and reset
+	// when usage drops back under the limit, so each pause episode warns once.
 	warnedEvictFreedNothing bool
 	warnLastModelOver       sync.Once
+}
+
+// budgetSnapshot is a usage sample together with the ready set it describes.
+type budgetSnapshot struct {
+	sample memSample
+	ready  map[string]bool
+}
+
+// budgetEviction records a periodic eviction: the sample it was decided on,
+// the ready set at that time, and when the evicted processes finished
+// stopping.
+type budgetEviction struct {
+	sample memSample
+	ready  map[string]bool
+	doneAt time.Time
 }
 
 func NewBudget(conf config.Config, logs *logmon.Group, perfMon *perf.Monitor) (*Budget, error) {
@@ -113,7 +107,7 @@ func NewBudget(conf config.Config, logs *logmon.Group, perfMon *perf.Monitor) (*
 		return nil, err
 	}
 
-	r := &Budget{baseRouter: base, swapper: swapper}
+	r := &Budget{baseRouter: base, swapper: swapper, sampleEvery: perfMon.Every}
 	go base.run()
 	go r.enforceBudgetPeriodically(base.procCtx)
 	return r, nil
@@ -122,14 +116,10 @@ func NewBudget(conf config.Config, logs *logmon.Group, perfMon *perf.Monitor) (*
 // enforceBudgetPeriodically re-checks usage on a timer and evicts even when no
 // new model is loading.
 //
-// EvictionFor only runs at swap-start, and it samples usage *before* the
-// incoming model finishes loading — so the model that actually tips the host
-// over budget is never itself weighed against the limit. If nothing else
-// tries to load afterwards, there is no other trigger that would notice, and
-// the host just sits over budget (see the budgetSwapper doc comment for
-// why per-model footprint can't be predicted ahead of a load to fix this at
-// admission time instead). This closes that gap by checking independent of
-// swap events.
+// EvictionFor only runs when a swap starts, before the incoming model has
+// loaded, so the model that tips usage over the limit is never weighed
+// against it there. Without a periodic check the host would stay over budget
+// until the next swap.
 func (mb *Budget) enforceBudgetPeriodically(ctx context.Context) {
 	timer := time.NewTimer(budgetCheckInterval)
 	defer timer.Stop()
@@ -145,169 +135,199 @@ func (mb *Budget) enforceBudgetPeriodically(ctx context.Context) {
 	}
 }
 
-// nextCheckInterval returns budgetActiveLoadCheckInterval if any model
-// is currently StateStarting, else budgetCheckInterval. Called after
-// each tick's work, so the tightened cadence takes effect for the tick
-// immediately following whatever just started loading.
+// nextCheckInterval returns the active-load interval (never shorter than the
+// perf monitor's sampling interval) while any model is StateStarting, else
+// budgetCheckInterval.
 func (mb *Budget) nextCheckInterval() time.Duration {
 	for _, st := range mb.RunningModels() {
 		if st == process.StateStarting {
-			return budgetActiveLoadCheckInterval
+			interval := budgetActiveLoadCheckInterval
+			if mb.sampleEvery != nil {
+				interval = max(interval, mb.sampleEvery())
+			}
+			return interval
 		}
 	}
 	return budgetCheckInterval
 }
 
-// observeAndLearn updates each model's learned footprint (see the learned
-// field's doc comment on budgetSwapper) from what changed between this
-// tick and the last: a rise in usedMB, attributed evenly across whatever
-// models finished loading (transitioned to ready) since the previous tick.
-// Concurrent loads of models with no prior observation are still invisible
-// to reservedForInFlightMB — there is nothing to learn from before their
-// first load — but every load after that is covered, including concurrent
-// repeats of the exact burst that caught this blind spot the first time.
+// observeAndLearn updates learned footprints (see budgetSwapper.learned) and
+// readySince.
+//
+// A footprint is the rise in usage from the baseline (a sample taken while
+// the model was not yet running) to the first sample taken after it became
+// ready. The weights land in memory while the model is still starting, so
+// the baseline must predate the load, not just the previous tick. When
+// several models finish loading against the same baseline, the rise is split
+// evenly between them. Nothing is learned when a model stopped in the
+// meantime (its freed memory would hide part of the rise), or when the
+// sample came from a different memory source than the baseline (except a
+// baseline taken before the host was classified, which carries a system
+// memory reading for this case; see usedMemoryMB).
 func (mb *Budget) observeAndLearn() {
-	usedMB, src := mb.swapper.usedMemoryMB()
-	if src == sourceNone {
-		mb.prevOK = false
-		return
-	}
+	now := time.Now()
+	smp := mb.swapper.usedMemoryMB()
+	statuses := mb.RunningStatus()
 
-	states := mb.RunningModels()
-	ready := make(map[string]bool, len(states))
-	for id, st := range states {
-		if st == process.StateReady {
+	running := make(map[string]bool, len(statuses))
+	ready := make(map[string]bool, len(statuses))
+	quiet := true
+	for id, st := range statuses {
+		running[id] = true
+		if st.State == process.StateReady {
 			ready[id] = true
+		} else {
+			quiet = false
 		}
 	}
 
 	var newlyReady []string
 	for id := range ready {
-		if !mb.prevReady[id] {
-			newlyReady = append(newlyReady, id)
+		if mb.prevReady[id] {
+			continue
+		}
+		newlyReady = append(newlyReady, id)
+		at := statuses[id].ReadySince
+		if at.IsZero() {
+			at = now
+		}
+		mb.swapper.recordReadySince([]string{id}, at)
+		if at.After(mb.lastChangeAt) {
+			mb.lastChangeAt = at
 		}
 	}
-	// Recorded unconditionally (even on the very first tick, and even when
-	// there's no usable delta to learn from below) — pickEvictions' grace
-	// period needs to know when a model became ready regardless of whether
-	// this tick can also attribute a footprint to it.
-	if len(newlyReady) > 0 {
-		mb.swapper.recordReadySince(newlyReady, time.Now())
-	}
-
-	if mb.prevOK {
-		// A negative or zero delta means something was evicted in between
-		// too, or usage otherwise fell — not a usable signal for what the
-		// newly-ready models cost, so skip learning this tick rather than
-		// record a bogus (or negative) footprint.
-		if delta := usedMB - mb.prevUsedMB; len(newlyReady) > 0 && delta > 0 {
-			mb.swapper.recordLearned(newlyReady, delta/int64(len(newlyReady)))
+	for id := range mb.prevRunning {
+		if !running[id] {
+			// Stopped since the last call, at an unknown time up to now.
+			mb.lastChangeAt = now
 		}
 	}
-
+	if !quiet {
+		mb.lastChangeAt = now
+	}
+	mb.prevRunning = running
 	mb.prevReady = ready
-	mb.prevUsedMB = usedMB
-	mb.prevOK = true
-}
 
-func (mb *Budget) enforceBudgetOnce() {
-	usedMB, src := mb.swapper.usedMemoryMB()
-	if src == sourceNone {
+	if !quiet || smp.src == sourceNone || smp.at.Before(mb.lastChangeAt) {
 		return
 	}
-	if usedMB <= mb.swapper.limitMB {
-		// Back under budget: whatever we evicted last worked, so let a
-		// future overshoot evict again.
-		mb.lastEvictUsedMB = 0
-		mb.lastEvictReady = nil
+
+	if b := mb.baseline; b != nil {
+		baseMB, ok := b.sample.comparableMB(smp.src)
+		if !ok {
+			mb.baseline = &budgetSnapshot{sample: smp, ready: ready}
+			return
+		}
+		var added []string
+		removed := false
+		for id := range ready {
+			if !b.ready[id] {
+				added = append(added, id)
+			}
+		}
+		for id := range b.ready {
+			if !ready[id] {
+				removed = true
+			}
+		}
+		if delta := smp.mb - baseMB; len(added) > 0 && !removed && delta > 0 {
+			mb.swapper.recordLearned(added, delta/int64(len(added)))
+		}
+	}
+	mb.baseline = &budgetSnapshot{sample: smp, ready: ready}
+}
+
+// enforceBudgetOnce evicts ready, idle models (lowest priority first, see
+// pickEvictions) while usage is over the limit.
+//
+// After an eviction it waits for a sample taken after the evicted processes
+// stopped. If that sample is no lower and nothing new became ready, the
+// memory over the limit is not held by models llama-swap can evict, so it
+// pauses (with a warning) until usage drops under the limit, instead of
+// evicting every model one tick at a time.
+func (mb *Budget) enforceBudgetOnce() {
+	smp := mb.swapper.usedMemoryMB()
+	if smp.src == sourceNone {
+		return
+	}
+	limitMB := mb.swapper.limitMB
+
+	if le := mb.lastEvict; le != nil {
+		if le.sample.src != smp.src {
+			// Samples from different pools cannot be compared.
+			mb.lastEvict = nil
+			mb.warnedEvictFreedNothing = false
+		} else if !smp.at.After(le.doneAt) {
+			mb.logger.Debugf("budget: periodic check waiting for a memory sample taken after the last eviction")
+			return
+		}
+	}
+
+	if smp.mb <= limitMB {
+		mb.lastEvict = nil
 		mb.warnedEvictFreedNothing = false
-		mb.logger.Debugf("budget: periodic check usedMB=%d limitMB=%d (under budget)", usedMB, mb.swapper.limitMB)
+		mb.logger.Debugf("budget: periodic check usedMB=%d limitMB=%d (under budget)", smp.mb, limitMB)
 		return
 	}
 
 	states := mb.RunningModels()
-	running := make([]string, 0, len(states))
 	ready := make([]string, 0, len(states))
 	readySet := make(map[string]bool, len(states))
-	busy := 0
 	for id, st := range states {
-		running = append(running, id)
-		if st != process.StateReady {
-			continue
+		if st == process.StateReady {
+			ready = append(ready, id)
+			readySet[id] = true
 		}
-		readySet[id] = true
-		// A busy model is never a periodic-eviction candidate, full stop —
-		// not "tried last" like the grace period below, but excluded
-		// entirely. Unlike an admission-time swap, which the scheduler
-		// queues behind rather than evicting into when the target is busy
-		// (conflictsWithInFlight), periodic eviction goes straight to
-		// Unload/StopProcesses with no such check of its own; without this,
-		// it can and did kill a model mid-response. readySet still counts it
-		// though — hasNewMember above cares whether something finished
-		// loading, not whether it happens to be busy right now.
-		if mb.InFlightCount(id) > 0 {
-			busy++
-			continue
-		}
-		ready = append(ready, id)
 	}
 
-	// An earlier tick evicted and usage has not dropped since — but that only
-	// means eviction isn't helping if the ready set hasn't changed either. A
-	// concurrent load finishing in between raises usedMB for reasons that have
-	// nothing to do with whether the eviction worked, and on a host taking a
-	// burst of loads that can happen every tick — pausing here would disable
-	// protection for as long as the burst continues, exactly when it's needed
-	// most. Only pause when usage sat still AND nothing newly finished loading
-	// to explain it: that combination is the actual signature of memory held
-	// outside the models llama-swap manages (the unified-memory fallback in
-	// usedMemoryMB counts everything on the host, not just models).
-	if mb.lastEvictUsedMB != 0 && usedMB >= mb.lastEvictUsedMB && !hasNewMember(readySet, mb.lastEvictReady) {
+	// Usage did not drop since the last eviction, and no newly ready model
+	// explains it.
+	if le := mb.lastEvict; le != nil && smp.mb >= le.sample.mb && !hasNewMember(readySet, le.ready) {
 		if !mb.warnedEvictFreedNothing {
 			mb.warnedEvictFreedNothing = true
-			mb.logger.Warnf("budget: usedMB=%d limitMB=%d still over budget, the ready set is unchanged, and the previous eviction (at %dMB) froze nothing — pausing periodic eviction until usage drops. Memory over the limit is likely held outside the models llama-swap manages.", usedMB, mb.swapper.limitMB, mb.lastEvictUsedMB)
+			mb.logger.Warnf("budget: usedMB=%d limitMB=%d still over budget, the ready set is unchanged, and the previous eviction (at %dMB) freed nothing — pausing periodic eviction until usage drops. Memory over the limit is likely held outside the models llama-swap manages.", smp.mb, limitMB, le.sample.mb)
 		}
 		return
 	}
 
 	if len(ready) == 0 {
-		// Over budget with nothing evictable yet — either the only running
-		// model is still starting, or every ready model is busy serving a
-		// request right now. Nothing to do until the next tick.
-		mb.logger.Debugf("budget: periodic check usedMB=%d limitMB=%d over budget but no eviction candidate available yet (busy=%d)", usedMB, mb.swapper.limitMB, busy)
+		mb.logger.Debugf("budget: periodic check usedMB=%d limitMB=%d over budget but no model is ready yet", smp.mb, limitMB)
 		return
 	}
 
-	// No reservation here: this runs off a timer rather than at admission, so
-	// usedMB is a plain measurement of what is actually resident.
-	evict := mb.swapper.pickEvictions(ready, usedMB, 0, len(running))
-
-	// Never evict every running model. EvictionFor gets this for free — the
-	// incoming target is not in its candidate list, so something always
-	// survives — but periodic enforcement has no incoming model, and a
-	// single model whose own footprint exceeds the limit would otherwise be
-	// killed here, reloaded by the next request, and killed again a tick
-	// later, forever.
-	if maxEvict := len(running) - 1; len(evict) > maxEvict {
-		evict = evict[:maxEvict]
-	}
-	if len(evict) == 0 {
+	// Never evict every running model: with no incoming model to make room
+	// for, a single model over the limit would be evicted, reloaded by the
+	// next request and evicted again.
+	if len(states) <= 1 {
 		mb.warnLastModelOver.Do(func() {
-			mb.logger.Warnf("budget: usedMB=%d limitMB=%d over budget with only one model running — keeping it rather than evicting into an empty host. Raise the limit or lower the model's memory use.", usedMB, mb.swapper.limitMB)
+			mb.logger.Warnf("budget: usedMB=%d limitMB=%d over budget with only one model running — keeping it rather than evicting into an empty host. Raise the limit or lower the model's memory use.", smp.mb, limitMB)
 		})
 		return
 	}
-	mb.logger.Infof("budget: periodic check usedMB=%d limitMB=%d evicting=%v (over budget with no new model loading to trigger EvictionFor)", usedMB, mb.swapper.limitMB, evict)
-	mb.lastEvictUsedMB = usedMB
-	mb.lastEvictReady = readySet
-	mb.Unload(0, evict...)
+	maxEvict := len(states) - 1
+
+	// The idle check and the stop are one step on the run loop, so a model
+	// cannot be granted a request between them. The usage sample is a plain
+	// measurement here, so nothing is reserved for loading models.
+	evicted, done := mb.EvictIdle(ready, func(idle []string) []string {
+		evict := mb.swapper.pickEvictions(idle, smp.mb, 0, len(states))
+		if len(evict) > maxEvict {
+			evict = evict[:maxEvict]
+		}
+		return evict
+	})
+	if len(evicted) == 0 {
+		mb.logger.Debugf("budget: periodic check usedMB=%d limitMB=%d over budget but every ready model is busy", smp.mb, limitMB)
+		return
+	}
+	mb.logger.Infof("budget: periodic check usedMB=%d limitMB=%d evicting=%v (over budget with no new model loading to trigger EvictionFor)", smp.mb, limitMB, evicted)
+	<-done
+	mb.lastEvict = &budgetEviction{sample: smp, ready: readySet, doneAt: time.Now()}
 }
 
-// hasNewMember reports whether current contains any key absent from previous
-// — i.e. something is ready now that wasn't at the last eviction. A ready set
-// that only shrank or stayed the same (the expected shape of eviction taking
-// effect) returns false: only growth signals a concurrent load that could
-// explain a usage rise unrelated to whether the eviction helped.
+// hasNewMember reports whether current contains any key absent from previous.
+// A ready set that only shrank (the expected effect of eviction) returns
+// false; growth means a load finished, which can explain a usage rise.
 func hasNewMember(current, previous map[string]bool) bool {
 	for k := range current {
 		if !previous[k] {
@@ -317,82 +337,76 @@ func hasNewMember(current, previous map[string]bool) bool {
 	return false
 }
 
-// budgetSwapper decides evictions by keeping total VRAM used (summed
-// across all GPUs, sampled live from the host's GPU monitor) under a
+// budgetSwapper decides evictions by keeping total VRAM used under a
 // configured limit, evicting lowest-priority (ties broken by
 // least-recently-used) models first, and continuing through higher-priority
 // models too if that's what it takes to fit the requested model.
 //
+// The limit applies to VRAM summed across all GPUs. On a multi-GPU host one
+// card can run out of memory while the total is still under the limit.
+//
 // On hosts with unified CPU/GPU memory, where GPU tools report 0MB VRAM used,
 // the budget is applied to system memory used instead (see usedMemoryMB).
 //
-// VRAM usage is not attributed per model: the GPU monitoring tools this
-// relies on (nvidia-smi, rocm-smi, LACT, ...) report total VRAM used across
-// all processes on the GPU, not a per-model breakdown, and per-process
-// attribution isn't available consistently across vendors. So instead of
-// tracking each model's individual footprint, eviction treats the current
-// total as a shared pool: each evicted model is assumed to free an equal
-// share of it.
+// GPU monitoring tools (nvidia-smi, rocm-smi, LACT, ...) report total VRAM
+// used, not a per-model breakdown, so eviction treats the current total as a
+// shared pool: each evicted model is assumed to free an equal share of it.
 type budgetSwapper struct {
 	limitMB   int64
 	priority  map[string]int // model ID -> priority, default 0
 	processes map[string]process.Process
 	logger    *logmon.Monitor
 
-	// sampleVRAMUsedMB returns total VRAM used in MB across all GPUs, and
-	// false if no sample is available yet. Defaults to perfMon.VRAMUsedMB;
-	// tests override it to avoid depending on real GPU monitoring tools.
-	sampleVRAMUsedMB func() (int64, bool)
+	// sampleVRAMUsedMB returns total VRAM used in MB across all GPUs and when
+	// it was sampled, and false if no sample is available yet. Defaults to
+	// perfMon.VRAMUsedMB; tests override it.
+	sampleVRAMUsedMB func() (int64, time.Time, bool)
 
-	// sampleSysMemUsedMB returns system memory used in MB, and false if no
-	// sample is available yet. Used as the budget signal on unified-memory
-	// hosts, where VRAM reads 0. Defaults to perfMon.SysMemUsedMB.
-	sampleSysMemUsedMB func() (int64, bool)
+	// sampleSysMemUsedMB returns system memory used in MB and when it was
+	// sampled, and false if no sample is available yet. Used as the budget
+	// signal on unified-memory hosts. Defaults to perfMon.SysMemUsedMB.
+	sampleSysMemUsedMB func() (int64, time.Time, bool)
+
+	// memMode is the memoryMode usedMemoryMB has settled on.
+	memMode atomic.Int32
 
 	// learned holds each model's recent observed footprints in MB (most
-	// recent last, capped at learnedHistoryLen), filled in by observeAndLearn
-	// as models finish loading. EvictionFor reserves budget for models that
-	// are running-but-not-ready (still loading) from the median of a model's
-	// history — see learnedFootprintLocked — so a burst of concurrent loads
-	// doesn't all sail through the "fits without eviction" check against a
-	// usedMB sample that predates every one of them finishing.
+	// recent last, capped at learnedHistoryLen), filled in by observeAndLearn.
+	// EvictionFor reserves the median of a model's history for models that
+	// are still loading (see reservedForInFlightMB), so a burst of concurrent
+	// loads is not admitted against a sample that predates all of them.
 	//
-	// A single observation can be noise rather than signal: usedMemoryMB's
-	// unified-memory fallback counts every process on the host, so an
-	// unrelated allocation (another container, a training job, ...) that
-	// happens to land in the same window as a load gets attributed to that
-	// model. Trusting the latest observation outright — as if every sample
-	// were clean VRAM — would let that noise drive real eviction decisions.
-	// The median of several observations is far more robust: a model's real
-	// footprint recurs every time it loads, so it dominates the median, while
-	// unrelated noise varies and gets outvoted. A model with too few
-	// observations yet (see minLearnedSamples) contributes no reservation,
-	// same as one never observed at all — not enough signal yet to trust.
+	// The median is used because a single observation can be noise: on the
+	// system-memory fallback any unrelated allocation during a load is
+	// attributed to that model. A model with fewer than minLearnedSamples
+	// observations reserves nothing.
 	learnedMu sync.RWMutex
 	learned   map[string][]int64
 
-	// readySince is when each model last transitioned to StateReady, filled
-	// in by observeAndLearn. pickEvictions uses it to defer evicting a model
-	// still inside budgetEvictionGracePeriod of its own load: periodic
-	// eviction (unlike an admission-time swap, which the FIFO scheduler
-	// queues behind via conflictsWithInFlight rather than evicting into) does
-	// not check whether a model is currently serving a request before
-	// stopping it, so without this a model can be — and was, in practice —
-	// killed moments after loading, potentially mid-response to the very
-	// request that just loaded it. Priority alone doesn't protect against
-	// this: a model configured at a low priority is a prime eviction target
-	// the instant it becomes ready, if the host happens to be over budget at
-	// that moment, which a load that pushes usage up often causes directly.
+	// readySince is when each model last became ready, filled in by
+	// observeAndLearn. pickEvictions tries models inside
+	// budgetEvictionGracePeriod of their load last, so a low-priority model is
+	// not evicted the moment it finishes loading for the request waiting on
+	// it.
 	readySinceMu sync.RWMutex
 	readySince   map[string]time.Time
+
+	// lastDecision is the sample and reservation behind the last EvictionFor
+	// call, for OnSwapStart to log. Only touched on the run loop.
+	lastDecision budgetDecision
 
 	warnUnified sync.Once
 }
 
-// budgetEvictionGracePeriod is how long a model is protected from
-// periodic eviction after becoming ready — see the readySince field's doc
-// comment. Chosen to comfortably outlast a typical inference response rather
-// than to match any particular check interval.
+type budgetDecision struct {
+	target   string
+	sample   memSample
+	reserved int64
+}
+
+// budgetEvictionGracePeriod is how long a model is tried last for periodic
+// eviction after becoming ready. Chosen to comfortably outlast a typical
+// inference response rather than to match any particular check interval.
 const budgetEvictionGracePeriod = 30 * time.Second
 
 // recordReadySince sets readySince[id] = at for each of ids.
@@ -408,9 +422,8 @@ func (s *budgetSwapper) recordReadySince(ids []string, at time.Time) {
 }
 
 // recentlyReady reports whether id became ready within the last
-// budgetEvictionGracePeriod. A model with no recorded readySince (for
-// example one that was already ready before this swapper started observing)
-// is not protected: there is no basis to believe it just loaded.
+// budgetEvictionGracePeriod. A model with no recorded readySince is not
+// protected.
 func (s *budgetSwapper) recentlyReady(id string) bool {
 	s.readySinceMu.RLock()
 	defer s.readySinceMu.RUnlock()
@@ -463,20 +476,13 @@ func (s *budgetSwapper) learnedFootprintLocked(id string) int64 {
 }
 
 // reservedForInFlightMB sums the learned footprint of every model in running
-// that is committed to load but not yet reflected in a usedMB sample — that
-// is, StateStarting, or StateStopped for a swap target the scheduler has
-// committed to but not started yet (running carries those via activeTargets).
+// that is committed to load but not yet reflected in a usage sample:
+// StateStarting, or StateStopped for a swap target the scheduler has
+// committed to but not started yet.
 //
-// Ready models are already in the sample. So are stopping ones, and they are
-// on their way *out* of it: running includes StateStopping (see
-// baseRouter.RunningModels), so counting those would add the footprint of a
-// model whose memory is still in the sample and about to be freed, on top of
-// the sample that already has it — inflating usage at exactly the moment an
-// eviction is in progress and cascading into evicting more than needed.
-//
-// Models with fewer than minLearnedSamples observations (including none at
-// all) contribute 0: not enough signal yet to trust over noise, same as the
-// blind spot this exists to shrink but cannot fully close.
+// Ready models are already in the sample. Stopping models are too, and
+// their memory is about to be freed, so reserving for them would count them
+// twice and evict more than needed.
 func (s *budgetSwapper) reservedForInFlightMB(running []string) int64 {
 	s.learnedMu.RLock()
 	defer s.learnedMu.RUnlock()
@@ -500,82 +506,147 @@ type memorySource int
 const (
 	// sourceNone means no sample was available.
 	sourceNone memorySource = iota
-	// sourceVRAM is total VRAM across all GPUs: models and nothing else of
-	// consequence, so a rise in it is attributable to a model.
+	// sourceVRAM is total VRAM across all GPUs.
 	sourceVRAM
 	// sourceSysMem is the unified-memory fallback, which counts every
 	// process on the host rather than only models.
 	sourceSysMem
 )
 
-// usedMemoryMB samples memory used by the pool the budget applies to, and
-// reports which pool that was.
+// memoryMode is what usedMemoryMB has concluded about the host.
+type memoryMode int32
+
+const (
+	// memModeUnknown: VRAM has only read 0, with no model ready.
+	memModeUnknown memoryMode = iota
+	// memModeDiscrete: VRAM has read above 0, so it is tracked directly.
+	memModeDiscrete
+	// memModeUnified: VRAM read 0 while a model was ready.
+	memModeUnified
+)
+
+// memSample is one usage reading and the pool and time it was sampled from.
+type memSample struct {
+	mb  int64
+	src memorySource
+	at  time.Time
+	// sysMB is system memory used at the same time, set (hasSys) only on a
+	// VRAM-0 sample taken before the host was classified discrete or unified.
+	sysMB  int64
+	hasSys bool
+}
+
+// comparableMB returns s's reading in the pool src, and false if s has none.
+func (s memSample) comparableMB(src memorySource) (int64, bool) {
+	if s.src == src {
+		return s.mb, true
+	}
+	if src == sourceSysMem && s.hasSys {
+		return s.sysMB, true
+	}
+	return 0, false
+}
+
+// usedMemoryMB samples memory used by the pool the budget applies to.
 //
 // Normally that is total VRAM across all GPUs. Hosts with unified CPU/GPU
-// memory (NVIDIA Grace-Blackwell GB10, for example) have no separate
-// framebuffer, so nvidia-smi reports memory.used as 0 even while models are
-// resident; budgeting against a permanent 0 would silently disable eviction.
-// There the pool is system RAM, so fall back to system memory used (the same
-// figure `free` reports as used) and note the switch once.
+// memory (NVIDIA Grace-Blackwell GB10, for example) report 0MB VRAM used even
+// while models are resident, so there the pool is system memory used. A
+// discrete GPU can also read 0 when nothing is loaded, so a 0 reading only
+// switches to system memory once a model is ready, and never after VRAM has
+// read above 0. With no VRAM sample at all, system memory is used.
 //
-// The source is sourceNone when neither has produced a sample yet.
-func (s *budgetSwapper) usedMemoryMB() (int64, memorySource) {
-	if usedMB, ok := s.sampleVRAMUsedMB(); ok && usedMB > 0 {
-		return usedMB, sourceVRAM
+// The source is sourceNone when no usable sample exists yet.
+func (s *budgetSwapper) usedMemoryMB() memSample {
+	vramMB, at, ok := s.sampleVRAMUsedMB()
+	if ok {
+		mode := memoryMode(s.memMode.Load())
+		if vramMB > 0 {
+			s.memMode.Store(int32(memModeDiscrete))
+			return newMemSample(vramMB, sourceVRAM, at)
+		}
+		if mode == memModeDiscrete {
+			return newMemSample(0, sourceVRAM, at)
+		}
+		if mode == memModeUnknown && !s.anyReady() {
+			// Host type not known yet. Keep the system memory reading too, so
+			// a baseline taken now still works if the host turns out unified.
+			smp := newMemSample(0, sourceVRAM, at)
+			if s.sampleSysMemUsedMB != nil {
+				if sysMB, _, sysOK := s.sampleSysMemUsedMB(); sysOK {
+					smp.sysMB, smp.hasSys = sysMB, true
+				}
+			}
+			return smp
+		}
 	}
 	if s.sampleSysMemUsedMB == nil {
-		return 0, sourceNone
+		return memSample{}
 	}
-	usedMB, ok := s.sampleSysMemUsedMB()
-	if !ok {
-		return 0, sourceNone
+	sysMB, sysAt, sysOK := s.sampleSysMemUsedMB()
+	if !sysOK {
+		return memSample{}
 	}
-	s.warnUnified.Do(func() {
-		s.logger.Warnf("budget: GPU monitoring reports 0MB VRAM used, budgeting against system memory used (%dMB) instead. Expected on hosts with unified CPU/GPU memory (for example NVIDIA Grace-Blackwell GB10); note that system memory used counts everything on the host, not only models.", usedMB)
-	})
-	return usedMB, sourceSysMem
+	if ok {
+		s.memMode.Store(int32(memModeUnified))
+		s.warnUnified.Do(func() {
+			s.logger.Warnf("budget: GPU monitoring reports 0MB VRAM used while models are loaded, budgeting against system memory used (%dMB) instead. Expected on hosts with unified CPU/GPU memory (for example NVIDIA Grace-Blackwell GB10); note that system memory used counts everything on the host, not only models.", sysMB)
+		})
+	}
+	return newMemSample(sysMB, sourceSysMem, sysAt)
+}
+
+// newMemSample builds a sample. A missing timestamp is treated as now.
+func newMemSample(mb int64, src memorySource, at time.Time) memSample {
+	if at.IsZero() {
+		at = time.Now()
+	}
+	return memSample{mb: mb, src: src, at: at}
+}
+
+// anyReady reports whether any managed model is ready.
+func (s *budgetSwapper) anyReady() bool {
+	for _, p := range s.processes {
+		if p.State() == process.StateReady {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *budgetSwapper) EvictionFor(target string, running []string) []string {
+	s.lastDecision = budgetDecision{target: target}
 	if slices.Contains(running, target) || len(running) == 0 {
 		return nil
 	}
 
-	sampledMB, src := s.usedMemoryMB()
-	if src == sourceNone {
+	smp := s.usedMemoryMB()
+	if smp.src == sourceNone {
 		return nil
 	}
 	reservedMB := s.reservedForInFlightMB(running)
-	if sampledMB+reservedMB <= s.limitMB {
+	s.lastDecision = budgetDecision{target: target, sample: smp, reserved: reservedMB}
+	if smp.mb+reservedMB <= s.limitMB {
 		return nil
 	}
 
-	return s.pickEvictions(running, sampledMB, reservedMB, len(running))
+	return s.pickEvictions(running, smp.mb, reservedMB, len(running))
 }
 
 // pickEvictions greedily selects the lowest-priority (ties broken by
 // least-recently-used) models from candidates until sampledMB+reservedMB,
 // decremented by an equal share per eviction, would drop to or below the
-// limit. shareDivisor is the size of the pool the share is computed against —
+// limit. shareDivisor is the size of the pool the share is computed against:
 // usually len(candidates), but callers evicting from a subset of the running
-// set (e.g. periodic enforcement skipping still-starting processes) pass the
-// full running count so the assumed per-model share stays accurate.
+// set pass the full running count so the assumed per-model share stays
+// accurate.
 //
-// Candidates still inside their grace period (see the readySince field's doc
-// comment) are tried only after every other candidate, regardless of
-// priority: a model that just finished loading may still be serving the
-// request that loaded it, and periodic eviction has no way to tell — unlike
-// an admission-time swap, which the FIFO scheduler defers rather than
-// evicting into when the target is busy. Reaching into a protected candidate
-// anyway (when nothing else is left to evict) is preferred over never
-// reclaiming memory at all; it just goes last.
+// Candidates inside their grace period (see readySince) are tried after
+// every other candidate regardless of priority, but are still evicted if
+// nothing else is left.
 //
-// VRAM isn't attributed per model (see the budgetSwapper doc comment),
-// so each eviction is assumed to free an equal share of the total currently
-// used. Only sampledMB is divided into shares: reservedMB stands for models
-// that have not loaded yet (see reservedForInFlightMB), so no amount of
-// evicting ready models gives it back, and folding it into the share would
-// overstate what each eviction actually frees.
+// Only sampledMB is divided into shares: reservedMB stands for models that
+// have not loaded yet, which evicting a ready model cannot free.
 func (s *budgetSwapper) pickEvictions(candidates []string, sampledMB, reservedMB int64, shareDivisor int) []string {
 	if shareDivisor == 0 {
 		return nil
@@ -620,19 +691,22 @@ func (s *budgetSwapper) sortByPriorityAndLRU(ids []string) []string {
 	return sorted
 }
 
-func (s *budgetSwapper) OnSwapStart(target string, running []string) {
-	evict := s.EvictionFor(target, running)
-	usedMB, src := s.usedMemoryMB()
-	reserved := s.reservedForInFlightMB(running)
+// OnSwapStart logs the eviction the scheduler acted on, with the sample and
+// reservation EvictionFor decided it from.
+func (s *budgetSwapper) OnSwapStart(target string, running, evict []string) {
+	d := s.lastDecision
+	if d.target != target {
+		d = budgetDecision{target: target}
+	}
 	switch {
 	case len(evict) > 0:
-		s.logger.Infof("budget: model=%s usedMB=%d reservedMB=%d limitMB=%d evict=%v", target, usedMB, reserved, s.limitMB, evict)
+		s.logger.Infof("budget: model=%s usedMB=%d reservedMB=%d limitMB=%d evict=%v", target, d.sample.mb, d.reserved, s.limitMB, evict)
 	case len(running) == 0:
 		s.logger.Infof("budget: model=%s starting (no models running)", target)
-	case src == sourceNone:
+	case d.sample.src == sourceNone:
 		s.logger.Debugf("budget: model=%s starting (no memory sample available yet)", target)
 	default:
-		s.logger.Debugf("budget: model=%s fits without eviction (usedMB=%d reservedMB=%d limitMB=%d)", target, usedMB, reserved, s.limitMB)
+		s.logger.Debugf("budget: model=%s fits without eviction (usedMB=%d reservedMB=%d limitMB=%d)", target, d.sample.mb, d.reserved, s.limitMB)
 	}
 }
 

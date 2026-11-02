@@ -276,32 +276,44 @@ func (m *Monitor) LatestGpuStats() []GpuStat {
 	return snapshot
 }
 
-// VRAMUsedMB sums MemUsedMB across all GPUs from the latest sample. ok is
+// Every returns the configured sampling interval.
+func (m *Monitor) Every() time.Duration {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+	return m.conf.Every
+}
+
+// VRAMUsedMB sums MemUsedMB across all GPUs from the latest sample, and
+// returns when that sample was taken (the newest per-GPU timestamp). ok is
 // false if no GPU stats have been recorded yet (monitoring disabled, no
 // supported tool found on this host, or no sample collected yet).
-func (m *Monitor) VRAMUsedMB() (mb int64, ok bool) {
+func (m *Monitor) VRAMUsedMB() (mb int64, at time.Time, ok bool) {
 	stats := m.LatestGpuStats()
 	if len(stats) == 0 {
-		return 0, false
+		return 0, time.Time{}, false
 	}
 	var total int64
 	for _, s := range stats {
 		total += int64(s.MemUsedMB)
+		if s.Timestamp.After(at) {
+			at = s.Timestamp
+		}
 	}
-	return total, true
+	return total, at, true
 }
 
 // SysMemUsedMB returns system memory used in MB from the latest sample (the
-// same figure as `free`'s used column: excludes buffers and cache). ok is
-// false if no system stats have been recorded yet.
-func (m *Monitor) SysMemUsedMB() (mb int64, ok bool) {
+// same figure as `free`'s used column: excludes buffers and cache), and when
+// that sample was taken. ok is false if no system stats have been recorded
+// yet.
+func (m *Monitor) SysMemUsedMB() (mb int64, at time.Time, ok bool) {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 	s, ok := m.sysRing.Last()
 	if !ok {
-		return 0, false
+		return 0, time.Time{}, false
 	}
-	return int64(s.MemUsedMB), true
+	return int64(s.MemUsedMB), s.Timestamp, true
 }
 
 func ReadSysStats() (SysStat, error) {

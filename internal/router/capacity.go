@@ -231,7 +231,7 @@ func (s *capacitySwapper) evictionFor(target string, running []string) []string 
 }
 
 // OnSwapStart logs the cached eviction plan when the scheduler begins a swap.
-func (s *capacitySwapper) OnSwapStart(target string, running []string) {
+func (s *capacitySwapper) OnSwapStart(target string, running, _ []string) {
 	evict := s.EvictionFor(target, running)
 	if len(evict) > 0 {
 		s.logger.Infof("capacity: model=%s evict=%v pools=%v search_nodes=%d search_limited=%t", target, evict, s.capacity.Pools, s.searchNodes, s.searchLimited)

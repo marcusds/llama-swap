@@ -28,9 +28,20 @@ type unloadReq struct {
 	respond chan struct{}
 }
 
-type inFlightQuery struct {
-	modelID string
-	respond chan int
+type evictIdleReq struct {
+	candidates []string
+	choose     func(idle []string) []string
+	respond    chan evictIdleResp
+}
+
+type evictIdleResp struct {
+	evicted []string
+	done    <-chan struct{}
+}
+
+type evictDone struct {
+	ids  []string
+	done chan struct{}
 }
 
 // baseRouter owns the channels, run-loop, and process machinery shared by every
@@ -65,7 +76,8 @@ type baseRouter struct {
 	unloadCh    chan unloadReq
 	swapDoneCh  chan scheduler.SwapDone
 	serveDoneCh chan scheduler.ServeDoneEvent
-	inFlightCh  chan inFlightQuery
+	evictCh     chan evictIdleReq
+	evictDoneCh chan evictDone
 
 	runDone chan struct{}
 
@@ -106,7 +118,8 @@ func newBaseRouter(
 		unloadCh:    make(chan unloadReq),
 		swapDoneCh:  make(chan scheduler.SwapDone),
 		serveDoneCh: make(chan scheduler.ServeDoneEvent),
-		inFlightCh:  make(chan inFlightQuery),
+		evictCh:     make(chan evictIdleReq),
+		evictDoneCh: make(chan evictDone),
 		runDone:     make(chan struct{}),
 	}
 	sched, err := scheduler.New(conf, name, logger, planner, b)
@@ -152,8 +165,12 @@ func (b *baseRouter) run() {
 		case ev := <-b.serveDoneCh:
 			b.schedule.OnServeDone(ev)
 
-		case q := <-b.inFlightCh:
-			q.respond <- b.schedule.InFlightCount(q.modelID)
+		case req := <-b.evictCh:
+			req.respond <- b.startEvictIdle(req)
+
+		case ev := <-b.evictDoneCh:
+			b.schedule.OnEvictDone(ev.ids)
+			close(ev.done)
 		}
 	}
 }
@@ -528,24 +545,53 @@ func (b *baseRouter) addProcesses(conf config.Config, logs *logmon.Group) error 
 	return nil
 }
 
-// InFlightCount returns how many requests modelID's process is currently
-// serving, by funneling the query through the run loop so it's answered from
-// the same goroutine that owns the scheduler's state — this is safe to call
-// from any goroutine, including a periodic ticker outside the request path
-// (see scheduler.Scheduler.InFlightCount's doc comment for why it exists).
-func (b *baseRouter) InFlightCount(modelID string) int {
-	q := inFlightQuery{modelID: modelID, respond: make(chan int, 1)}
+// EvictIdle stops whichever of candidates choose picks, among those that are
+// ready and idle at the moment of the decision (see
+// scheduler.Scheduler.EvictIdle). The check and the claim happen in one step
+// on the run loop, so no request can be granted to a model in between; the
+// claimed models then stop off the run loop, each with its unloadTimeout, so
+// routing is not blocked meanwhile. Requests that arrive for them queue until
+// the stop finishes. done is closed once every evicted process has stopped
+// (or the router shut down).
+func (b *baseRouter) EvictIdle(candidates []string, choose func(idle []string) []string) (evicted []string, done <-chan struct{}) {
+	req := evictIdleReq{candidates: candidates, choose: choose, respond: make(chan evictIdleResp, 1)}
+	closed := make(chan struct{})
+	close(closed)
 	select {
-	case b.inFlightCh <- q:
+	case b.evictCh <- req:
 	case <-b.runDone:
-		return 0
+		return nil, closed
 	}
-	select {
-	case n := <-q.respond:
-		return n
-	case <-b.runDone:
-		return 0
+	resp := <-req.respond
+	return resp.evicted, resp.done
+}
+
+// startEvictIdle runs on the run loop: it claims the models through the
+// scheduler and launches their stop.
+func (b *baseRouter) startEvictIdle(req evictIdleReq) evictIdleResp {
+	done := make(chan struct{})
+	evicted := b.schedule.EvictIdle(req.candidates, req.choose)
+	if len(evicted) == 0 {
+		close(done)
+		return evictIdleResp{done: done}
 	}
+	go func() {
+		var wg sync.WaitGroup
+		for _, id := range evicted {
+			wg.Add(1)
+			go func(id string) {
+				defer wg.Done()
+				b.StopProcesses(b.unloadTimeout(id), []string{id})
+			}(id)
+		}
+		wg.Wait()
+		select {
+		case b.evictDoneCh <- evictDone{ids: evicted, done: done}:
+		case <-b.runDone:
+			close(done)
+		}
+	}()
+	return evictIdleResp{evicted: evicted, done: done}
 }
 
 func (b *baseRouter) Shutdown(timeout time.Duration) error {
