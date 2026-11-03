@@ -189,9 +189,8 @@ func TestBudget_PerProcessIgnoresSampleBeforeReady(t *testing.T) {
 		return map[int]int64{100: 1500}, time.Now().Add(-time.Hour), true
 	}
 	a.markReady()
-	s.recordReadySince([]string{"a"}, time.Now())
 
-	if got := s.measureProcesses(map[string]bool{"a": true}); len(got) != 0 {
+	if got, _ := s.measureProcesses(map[string]time.Time{"a": time.Now()}); len(got) != 0 {
 		t.Fatalf("measured=%v want none (sample predates ready)", got)
 	}
 	if _, ok := s.estimateMB("a"); ok {
@@ -219,5 +218,112 @@ func TestBudget_DeclaredSizeWinsOverMeasured(t *testing.T) {
 	s.declared = map[string]int64{"a": 3000}
 	if est, _ := s.estimateMB("a"); est != 3000 {
 		t.Fatalf("estimate=%d want declared 3000", est)
+	}
+}
+
+// TestBudget_DeltaLearningStopsOnceAllMeasured checks that the delta-learning
+// baseline is only kept while some configured model lacks a per-process
+// figure, and that an unmatched model is still learned from deltas alongside
+// a matched one.
+func TestBudget_DeltaLearningStopsOnceAllMeasured(t *testing.T) {
+	a := newFakeProcess("a")
+	a.testPid = 100
+	b := newFakeProcess("b")
+	b.testPid = 200 // e.g. started via docker: not in nvidia-smi's PID list
+
+	conf := config.Config{
+		HealthCheckTimeout: 5,
+		Routing:            config.RoutingConfig{Router: config.RouterConfig{Settings: config.RouterSettings{Budget: &config.BudgetConfig{LimitMB: 100000}}}},
+	}
+	var vramMB atomic.Int64
+	vramMB.Store(1000)
+	r := newTestBudgetWithUsage(t, conf, nil, map[string]process.Process{"a": a, "b": b}, &vramMB)
+	r.swapper.descendants = func(pid int) map[int]bool { return map[int]bool{pid: true} }
+	var procAt atomic.Int64
+	r.swapper.sampleProcVRAMMB = func() (map[int]int64, time.Time, bool) {
+		return map[int]int64{100: 4000, 999: 1}, time.Unix(0, procAt.Load()), true
+	}
+
+	// a loads and is measured per process; b has never been seen, so the
+	// baseline is still maintained.
+	r.observeAndLearn()
+	a.setState(process.StateStarting)
+	r.observeAndLearn()
+	a.markReady()
+	vramMB.Store(5000)
+	procAt.Store(time.Now().Add(time.Second).UnixNano())
+	r.observeAndLearn()
+	if r.baseline == nil {
+		t.Fatal("baseline dropped while b still has no per-process figure")
+	}
+
+	// b loads; it has no PID match, so its footprint comes from the delta.
+	b.setState(process.StateStarting)
+	r.observeAndLearn()
+	b.markReady()
+	vramMB.Store(8000)
+	r.observeAndLearn()
+	if hist := learnedHistory(r, "b"); len(hist) != 1 || hist[0] != 3000 {
+		t.Fatalf("learned[b]=%v want [3000] (delta 5000 -> 8000)", hist)
+	}
+	if hist := learnedHistory(r, "a"); len(hist) != 1 || hist[0] != 4000 {
+		t.Fatalf("learned[a]=%v want [4000] (per-process only, no delta)", hist)
+	}
+
+	// Once every model has a per-process figure the baseline is dropped.
+	r.swapper.measuredMu.Lock()
+	r.swapper.measured["b"] = 3000
+	r.swapper.measuredMu.Unlock()
+	r.observeAndLearn()
+	if r.baseline != nil {
+		t.Fatal("baseline kept although every model has a per-process figure")
+	}
+}
+
+// TestBudget_EnforceBudgetOncePausesWhenFreedLessThanPredicted checks that,
+// with per-process figures for the evicted model, periodic eviction pauses
+// when usage fell by much less than predicted, and carries on when it fell
+// by about what was predicted.
+func TestBudget_EnforceBudgetOncePausesWhenFreedLessThanPredicted(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		afterMB    int64
+		wantBStops int32
+	}{
+		{"freed 500 of 8000: pause", 19500, 0},
+		{"freed 4000 of 8000: continue", 16000, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newFakeProcess("a")
+			a.markReady()
+			b := newFakeProcess("b")
+			b.markReady()
+			c := newFakeProcess("c")
+			c.markReady()
+			conf := config.Config{
+				HealthCheckTimeout: 5,
+				Routing:            config.RoutingConfig{Router: config.RouterConfig{Settings: config.RouterSettings{Budget: &config.BudgetConfig{LimitMB: 15000}}}},
+			}
+			var used atomic.Int64
+			used.Store(20000)
+			r := newTestBudgetWithUsage(t, conf, map[string]int{"a": 1, "b": 5, "c": 10},
+				map[string]process.Process{"a": a, "b": b, "c": c}, &used)
+			r.swapper.measured = map[string]int64{"a": 8000, "b": 8000, "c": 4000}
+
+			// 20000 - 8000 (a) = 12000 fits: only a goes.
+			r.enforceBudgetOnce()
+			if a.stopCalls.Load() != 1 || b.stopCalls.Load() != 0 {
+				t.Fatalf("first tick: a.stops=%d b.stops=%d want 1, 0", a.stopCalls.Load(), b.stopCalls.Load())
+			}
+			if r.lastEvict == nil || r.lastEvict.predictedMB != 8000 {
+				t.Fatalf("lastEvict=%+v want predictedMB 8000", r.lastEvict)
+			}
+
+			used.Store(tc.afterMB)
+			r.enforceBudgetOnce()
+			if got := b.stopCalls.Load(); got != tc.wantBStops {
+				t.Fatalf("second tick: b.stops=%d want %d", got, tc.wantBStops)
+			}
+		})
 	}
 }

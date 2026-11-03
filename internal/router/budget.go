@@ -71,6 +71,9 @@ type budgetEviction struct {
 	sample memSample
 	ready  map[string]bool
 	doneAt time.Time
+	// predictedMB is the sum of the evicted models' per-process figures, or
+	// 0 when any evicted model had none.
+	predictedMB int64
 }
 
 func NewBudget(conf config.Config, logs *logmon.Group, perfMon *perf.Monitor) (*Budget, error) {
@@ -157,13 +160,14 @@ func (mb *Budget) nextCheckInterval() time.Duration {
 	return budgetCheckInterval
 }
 
-// observeAndLearn updates learned footprints (see budgetSwapper.learned) and
-// readySince.
+// observeAndLearn updates learned footprints (see budgetSwapper.learned).
 //
 // Where per-process VRAM is available (see measureProcesses), a ready model's
-// footprint is read directly. Otherwise a footprint is the rise in usage from
-// the baseline (a sample taken while
-// the model was not yet running) to the first sample taken after it became
+// footprint is read directly, and the delta learning below only runs while
+// some configured model has no per-process figure (AMD and unified hosts, or
+// a model whose process tree does not hold its GPU process). A delta
+// footprint is the rise in usage from the baseline (a sample taken while the
+// model was not yet running) to the first sample taken after it became
 // ready. The weights land in memory while the model is still starting, so
 // the baseline must predate the load, not just the previous tick. When
 // several models finish loading against the same baseline, the rise is split
@@ -189,17 +193,14 @@ func (mb *Budget) observeAndLearn() {
 		}
 	}
 
-	var newlyReady []string
 	for id := range ready {
 		if mb.prevReady[id] {
 			continue
 		}
-		newlyReady = append(newlyReady, id)
 		at := statuses[id].ReadySince
 		if at.IsZero() {
 			at = now
 		}
-		mb.swapper.recordReadySince([]string{id}, at)
 		if at.After(mb.lastChangeAt) {
 			mb.lastChangeAt = at
 		}
@@ -218,7 +219,19 @@ func (mb *Budget) observeAndLearn() {
 
 	// Per-process figures, where available, are clean per-model data and need
 	// no quiet window.
-	perProc := mb.swapper.measureProcesses(ready)
+	readyAt := make(map[string]time.Time, len(ready))
+	for id := range ready {
+		readyAt[id] = statuses[id].ReadySince
+	}
+	perProc, procOK := mb.swapper.measureProcesses(readyAt)
+
+	// Delta learning is the fallback for models per-process data does not
+	// cover. Once every configured model has a per-process figure, it has
+	// nothing left to learn, so the baseline is dropped and not maintained.
+	if procOK && mb.swapper.allMeasured() {
+		mb.baseline = nil
+		return
+	}
 
 	if !quiet || smp.src == sourceNone || smp.at.Before(mb.lastChangeAt) {
 		return
@@ -264,8 +277,10 @@ func (mb *Budget) observeAndLearn() {
 // pickEvictions) while usage is over the limit.
 //
 // After an eviction it waits for a sample taken after the evicted processes
-// stopped. If that sample is no lower and nothing new became ready, the
-// memory over the limit is not held by models llama-swap can evict, so it
+// stopped. If that sample did not fall (or, with per-process figures for the
+// evicted models, fell by less than half what they predicted) and nothing new
+// became ready, the memory over the limit is not held by models llama-swap
+// can evict, so it
 // pauses (with a warning) until usage drops under the limit, instead of
 // evicting every model one tick at a time.
 func (mb *Budget) enforceBudgetOnce() {
@@ -303,14 +318,22 @@ func (mb *Budget) enforceBudgetOnce() {
 		}
 	}
 
-	// Usage did not drop since the last eviction, and no newly ready model
-	// explains it.
-	if le := mb.lastEvict; le != nil && smp.mb >= le.sample.mb && !hasNewMember(readySet, le.ready) {
-		if !mb.warnedEvictFreedNothing {
-			mb.warnedEvictFreedNothing = true
-			mb.logger.Warnf("budget: usedMB=%d limitMB=%d still over budget, the ready set is unchanged, and the previous eviction (at %dMB) freed nothing — pausing periodic eviction until usage drops. Memory over the limit is likely held outside the models llama-swap manages.", smp.mb, limitMB, le.sample.mb)
+	// The last eviction did not free what it should have, and no newly ready
+	// model explains it. With per-process figures for every evicted model,
+	// "should have" is at least half their sum; otherwise any drop at all.
+	if le := mb.lastEvict; le != nil && !hasNewMember(readySet, le.ready) {
+		freed := le.sample.mb - smp.mb
+		expected := int64(1)
+		if le.predictedMB > 0 {
+			expected = max(1, le.predictedMB/2)
 		}
-		return
+		if freed < expected {
+			if !mb.warnedEvictFreedNothing {
+				mb.warnedEvictFreedNothing = true
+				mb.logger.Warnf("budget: usedMB=%d limitMB=%d still over budget, the ready set is unchanged, and the previous eviction (at %dMB, expected to free %dMB) freed %dMB — pausing periodic eviction until usage drops. Memory over the limit is likely held outside the models llama-swap manages.", smp.mb, limitMB, le.sample.mb, le.predictedMB, max(0, freed))
+			}
+			return
+		}
 	}
 
 	if len(ready) == 0 {
@@ -348,8 +371,17 @@ func (mb *Budget) enforceBudgetOnce() {
 		return
 	}
 	mb.logger.Infof("budget: periodic check usedMB=%d limitMB=%d evicting=%v (over budget with no new model loading to trigger EvictionFor)", smp.mb, limitMB, evicted)
+	var predicted int64
+	for _, id := range evicted {
+		v, ok := mb.swapper.measuredMB(id)
+		if !ok {
+			predicted = 0
+			break
+		}
+		predicted += v
+	}
 	<-done
-	mb.lastEvict = &budgetEviction{sample: smp, ready: readySet, doneAt: time.Now()}
+	mb.lastEvict = &budgetEviction{sample: smp, ready: readySet, doneAt: time.Now(), predictedMB: predicted}
 }
 
 // hasNewMember reports whether current contains any key absent from previous.
@@ -412,7 +444,7 @@ type budgetSwapper struct {
 
 	// measured is each model's latest per-process VRAM figure, kept after
 	// the model stops so it still estimates the next load. procLearnedAt is
-	// the readySince of the load last recorded into learned from per-process
+	// the ReadySince of the load last recorded into learned from per-process
 	// data, so each load is recorded once.
 	measuredMu    sync.RWMutex
 	measured      map[string]int64
@@ -433,14 +465,6 @@ type budgetSwapper struct {
 	learnedMu sync.RWMutex
 	learned   map[string][]int64
 
-	// readySince is when each model last became ready, filled in by
-	// observeAndLearn. pickEvictions tries models inside
-	// budgetEvictionGracePeriod of their load last, so a low-priority model is
-	// not evicted the moment it finishes loading for the request waiting on
-	// it.
-	readySinceMu sync.RWMutex
-	readySince   map[string]time.Time
-
 	// lastDecision is the sample and reservation behind the last EvictionFor
 	// call, for OnSwapStart to log. Only touched on the run loop.
 	lastDecision budgetDecision
@@ -453,36 +477,6 @@ type budgetDecision struct {
 	sample   memSample
 	reserved int64
 	targetMB int64 // the target's estimate, 0 when unknown
-}
-
-// budgetEvictionGracePeriod is how long a model is tried last for periodic
-// eviction after becoming ready. Chosen to comfortably outlast a typical
-// inference response rather than to match any particular check interval.
-const budgetEvictionGracePeriod = 30 * time.Second
-
-// recordReadySince sets readySince[id] = at for each of ids.
-func (s *budgetSwapper) recordReadySince(ids []string, at time.Time) {
-	s.readySinceMu.Lock()
-	defer s.readySinceMu.Unlock()
-	if s.readySince == nil {
-		s.readySince = make(map[string]time.Time, len(ids))
-	}
-	for _, id := range ids {
-		s.readySince[id] = at
-	}
-}
-
-// recentlyReady reports whether id became ready within the last
-// budgetEvictionGracePeriod. A model with no recorded readySince is not
-// protected.
-func (s *budgetSwapper) recentlyReady(id string) bool {
-	s.readySinceMu.RLock()
-	defer s.readySinceMu.RUnlock()
-	t, ok := s.readySince[id]
-	if !ok {
-		return false
-	}
-	return time.Since(t) < budgetEvictionGracePeriod
 }
 
 // learnedHistoryLen is how many recent observations recordLearned keeps per
@@ -551,6 +545,27 @@ func (s *budgetSwapper) reservedForInFlightMB(running []string) int64 {
 	return reserved
 }
 
+// allMeasured reports whether every configured model has a per-process
+// figure.
+func (s *budgetSwapper) allMeasured() bool {
+	s.measuredMu.RLock()
+	defer s.measuredMu.RUnlock()
+	for id := range s.processes {
+		if _, ok := s.measured[id]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// measuredMB returns id's latest per-process figure, if any.
+func (s *budgetSwapper) measuredMB(id string) (int64, bool) {
+	s.measuredMu.RLock()
+	defer s.measuredMu.RUnlock()
+	v, ok := s.measured[id]
+	return v, ok && v > 0
+}
+
 // estimateMB returns id's expected footprint once loaded: its declared
 // sizeMB, else its latest per-process VRAM measurement, else the median of
 // its learned history. ok is false when none is available.
@@ -570,23 +585,24 @@ func (s *budgetSwapper) estimateMB(id string) (int64, bool) {
 	return v, v > 0
 }
 
-// measureProcesses reads per-process VRAM for each ready model, summed over
-// the model's process tree, and updates measured. A figure counts only when
-// the sample was taken after the model became ready. Each load's first such
-// figure is also recorded into learned, as clean data. It returns the figures
-// found this call, keyed by model ID; nil when per-process data is
-// unavailable.
-func (s *budgetSwapper) measureProcesses(ready map[string]bool) map[string]int64 {
-	if s.sampleProcVRAMMB == nil || s.descendants == nil || len(ready) == 0 {
-		return nil
+// measureProcesses reads per-process VRAM for each ready model (keyed by
+// model ID, valued by when it became ready), summed over the model's process
+// tree, and updates measured. A figure counts only when the sample was taken
+// after the model became ready. Each load's first such figure is also recorded
+// into learned, as clean data. It returns the figures found this call, and
+// whether per-process data was available at all (a sample with at least one
+// GPU process).
+func (s *budgetSwapper) measureProcesses(readyAt map[string]time.Time) (map[string]int64, bool) {
+	if s.sampleProcVRAMMB == nil || s.descendants == nil {
+		return nil, false
 	}
 	usage, at, ok := s.sampleProcVRAMMB()
 	if !ok || len(usage) == 0 {
-		return nil
+		return nil, false
 	}
-	out := make(map[string]int64, len(ready))
-	since := make(map[string]time.Time, len(ready))
-	for id := range ready {
+	out := make(map[string]int64, len(readyAt))
+	since := make(map[string]time.Time, len(readyAt))
+	for id, rs := range readyAt {
 		p, ok := s.processes[id]
 		if !ok {
 			continue
@@ -602,9 +618,6 @@ func (s *budgetSwapper) measureProcesses(ready map[string]bool) map[string]int64
 		if sum <= 0 {
 			continue
 		}
-		s.readySinceMu.RLock()
-		rs := s.readySince[id]
-		s.readySinceMu.RUnlock()
 		if at.Before(rs) {
 			continue // sampled before this load finished
 		}
@@ -612,7 +625,7 @@ func (s *budgetSwapper) measureProcesses(ready map[string]bool) map[string]int64
 		since[id] = rs
 	}
 	if len(out) == 0 {
-		return nil
+		return nil, true
 	}
 
 	var toLearn []string
@@ -632,7 +645,7 @@ func (s *budgetSwapper) measureProcesses(ready map[string]bool) map[string]int64
 	for _, id := range toLearn {
 		s.recordLearned([]string{id}, out[id])
 	}
-	return out
+	return out, true
 }
 
 // memorySource identifies which pool a usedMemoryMB sample was read from.
@@ -782,23 +795,15 @@ func (s *budgetSwapper) EvictionFor(target string, running []string) []string {
 // for, split across every model in pool with no estimate. pool is the full
 // running set, which may be larger than candidates.
 //
-// Candidates inside their grace period (see readySince) are tried after
-// every other candidate regardless of priority, but are still evicted if
-// nothing else is left.
+// Callers pass only evictable candidates: periodic enforcement goes through
+// EvictIdle, which excludes busy, reserved, queued and swapping models, so no
+// extra protection for just-loaded models is needed here.
 func (s *budgetSwapper) pickEvictions(candidates, pool []string, sampledMB, extraMB int64) []string {
 	if len(pool) == 0 {
 		return nil
 	}
 
-	var unprotected, protected []string
-	for _, id := range candidates {
-		if s.recentlyReady(id) {
-			protected = append(protected, id)
-		} else {
-			unprotected = append(unprotected, id)
-		}
-	}
-	sorted := append(s.sortByPriorityAndLRU(unprotected), s.sortByPriorityAndLRU(protected)...)
+	sorted := s.sortByPriorityAndLRU(candidates)
 
 	estimates := make(map[string]int64, len(pool))
 	var knownResidentMB int64
